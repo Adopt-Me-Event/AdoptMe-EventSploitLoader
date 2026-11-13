@@ -5,6 +5,8 @@ local runService = game:GetService("RunService")
 local userInputService = game:GetService("UserInputService")
 local tweenService = game:GetService("TweenService")
 local virtualUser = game:GetService("VirtualUser")
+local workspace = game:GetService("Workspace")
+
 local player = players.LocalPlayer or players.PlayerAdded:Wait()
 local playerGui = player:WaitForChild("PlayerGui")
 
@@ -16,6 +18,7 @@ getgenv().FarmerToggles = {
 	CommitPenActive = true,
 	BottlesActive = false,
 	CauldronActive = false,
+	SlushieActive = false,
 	SelectedBait = "cake"
 }
 
@@ -25,6 +28,7 @@ local ToggleStates = {
 	CommitPenActive = true,
 	BottlesActive = false,
 	CauldronActive = false,
+	SlushieActive = false,
 }
 
 local labels = {}
@@ -102,6 +106,11 @@ pcall(function()
 	end
 end)
 
+local SlushieMachineNet = nil
+pcall(function()
+	SlushieMachineNet = require(replicatedStorage.SharedModules.ContentPacks.Slushie2026.Game.SlushieMachineNet)
+end)
+
 local processedPositions = {}
 local totalRewardsClaimed = 0
 local isManagingLure = false
@@ -116,6 +125,16 @@ local CONFIG = {
 	DefaultBaitDuration = 7200,
 	MaxPetStage = 6,
 	PenSlotCount = 4,
+	SlushieFlavors = { "Blue", "Green", "Orange", "Red" },
+	SlushieCupKind = "slushie_2026_cup",
+	SlushieTiming = {
+		AFTER_BUY = 0.35,
+		AFTER_PLACE = 0.4,
+		BETWEEN_POURS = 0.35,
+		BEFORE_TAKE = 0.4,
+		TAKE_RETRY_DELAY = 0.35,
+		CYCLE_COOLDOWN = 0.5
+	},
 	Baits = {
 		cookie = { kind = "lightning_dimension_2026_cookie_bait", category = "food" },
 		cake = { kind = "lightning_dimension_2026_cake_bait", category = "food" }
@@ -160,6 +179,24 @@ local function invokeRemote(apiPath, ...)
 		end
 	end)
 	return res
+end
+
+local function invokeSlushieRemote(remote, data)
+	if not remote then return false, nil end
+	local success, result = pcall(function()
+		return if data ~= nil then remote:invoke_server_async(data) else remote:invoke_server_async()
+	end)
+
+	if not success then
+		return false, result
+	end
+
+	if type(result) == "table" and type(result.await) == "function" then
+		local ok, resolved = result:await()
+		return ok, resolved
+	end
+
+	return true, result
 end
 
 local DailiesNetService = nil
@@ -236,6 +273,103 @@ local function safeTakeBottle()
 			pcall(function() lightningNet.TakeBottle:invoke_server_async() end)
 		end
 	end)
+end
+
+local function getTargetCFrame(instance)
+	if instance:IsA("BasePart") then
+		return instance.CFrame
+	elseif instance:IsA("Model") then
+		return instance:GetPivot()
+	end
+	local part = instance:FindFirstChildWhichIsA("BasePart", true)
+	return part and part.CFrame or nil
+end
+
+local function spawnPlatformAt(targetCFrame)
+	local existing = workspace:FindFirstChild("TestLocationPlatform")
+	if existing then
+		existing:Destroy()
+	end
+
+	local platform = Instance.new("Part")
+	platform.Name = "TestLocationPlatform"
+	platform.Size = Vector3.new(25, 1, 25)
+	platform.Anchored = true
+	platform.CanCollide = true
+	platform.Material = Enum.Material.SmoothPlastic
+	platform.Color = Color3.fromRGB(70, 140, 220)
+	-- Moved down further (-4.5 studs below target)
+	platform.CFrame = targetCFrame * CFrame.new(0, -4.5, 0)
+	platform.Parent = workspace
+
+	return platform
+end
+
+local function enterSlushieLocationAndVerify()
+	local character = player.Character or player.CharacterAdded:Wait()
+	local rootPart = character:WaitForChild("HumanoidRootPart", 10)
+	if not rootPart then return false end
+
+	spawnPlatformAt(rootPart.CFrame)
+
+	local interiors = workspace:WaitForChild("Interiors", 15)
+	local mainMapFolder = interiors and interiors:FindFirstChild("MainMap!Default")
+
+	if not mainMapFolder then
+		local destination = "MainMap"
+		local subDestination = "MainDoor"
+
+		fireRemote("AdoptAPI/SendPassiveDoorEnter", destination, subDestination, {})
+		local ok, locationObj = pcall(function()
+			return Location.new(destination, subDestination, {})
+		end)
+
+		if ok and locationObj then
+			fireRemote("LocationAPI/SetLocation", locationObj.destination_id, locationObj.house_owner, locationObj.sub_destination_id)
+		else
+			fireRemote("LocationAPI/SetLocation", destination, nil, subDestination)
+		end
+
+		if InteriorsM and type(InteriorsM.enter) == "function" then
+			pcall(function()
+				InteriorsM.enter(destination, subDestination, {})
+			end)
+		end
+
+		repeat
+			mainMapFolder = interiors and interiors:FindFirstChild("MainMap!Default")
+			task.wait(0.1)
+		until mainMapFolder or not getgenv().MasterAutoFarmerActive or not getgenv().FarmerToggles.SlushieActive
+	end
+
+	if not mainMapFolder then return false end
+
+	local blocker = mainMapFolder:WaitForChild("SlushieVehicleBlocker", 15)
+	if not blocker then return false end
+
+	local blockerCFrame = getTargetCFrame(blocker)
+	if not blockerCFrame then return false end
+
+	local standCFrame = blockerCFrame * CFrame.new(0, 5, 0)
+	spawnPlatformAt(standCFrame)
+
+	local arrived = false
+	for attempt = 1, 20 do
+		if not getgenv().MasterAutoFarmerActive or not getgenv().FarmerToggles.SlushieActive then break end
+		rootPart.AssemblyLinearVelocity = Vector3.zero
+		rootPart.CFrame = standCFrame
+		task.wait(0.1)
+
+		local dist = (rootPart.Position - standCFrame.Position).Magnitude
+		if dist < 10 then
+			arrived = true
+			break
+		end
+	end
+
+	if not arrived then return false end
+	task.wait(0.5)
+	return true
 end
 
 local function enterLightningDimension()
@@ -327,7 +461,8 @@ local function enterLightningDimension()
 				platform.Color = Color3.fromRGB(35, 35, 45)
 				platform.Parent = gameFolder
 				
-				safeTeleport(rootPart, platform.CFrame + Vector3.new(0, 5, 0))
+				-- Moved down further (-4.0 studs offset)
+				safeTeleport(rootPart, platform.CFrame + Vector3.new(0, 4.0, 0))
 				task.wait(0.5)
 				safeTakeBottle()
 			end
@@ -767,6 +902,10 @@ local function createUI()
 		getgenv().FarmerToggles.CauldronActive = val
 	end)
 
+	addSwitchToggle("SlushieActive", "🥤 Slushie Maker", "Auto-buy, place, pour flavors, and take slushies", function(val)
+		getgenv().FarmerToggles.SlushieActive = val
+	end)
+
 	local extraPage = createTabPage("Extra")
 
 	local function addActionButton(text, color, callback)
@@ -803,7 +942,7 @@ local function createUI()
 	versionLabel.AnchorPoint = Vector2.new(0, 1)
 	versionLabel.Position = UDim2.new(0, 5, 1, -3)
 	versionLabel.BackgroundTransparency = 1
-	versionLabel.Text = "Version: Master Auto-Farm v3.1"
+	versionLabel.Text = "Version: Master Auto-Farm v3.3"
 	versionLabel.TextColor3 = Color3.fromRGB(120, 120, 120)
 	versionLabel.Font = Enum.Font.SourceSans
 	versionLabel.TextSize = 11
@@ -1151,7 +1290,7 @@ end
 
 local function getUnmaxedPets(count)
 	local inventory = getInventory()
-	if not inventory or type(inventory) ~= "table" or type(inventory.pets) ~= "table" then return {} end
+	if not inventory or type(inventory) ~= "table" and type(inventory.pets) ~= "table" then return {} end
 
 	local selectedPets = {}
 
@@ -1191,7 +1330,7 @@ task.spawn(function()
 			if not getgenv().FarmerToggles.PetPenActive then return end
 
 			local inventory = getInventory()
-			if not inventory or type(inventory) ~= "table" or type(inventory.pets) ~= "table" then return end
+			if not inventory or type(inventory) ~= "table" and type(inventory.pets) ~= "table" then return end
 
 			local progressionData = ClientDataModule.get("idle_progression")
 			if type(progressionData) ~= "table" then progressionData = {} end
@@ -1346,6 +1485,83 @@ local function triggerBottlePlacement(strikePos)
 		task.wait(CONFIG.WaitTimeForCharge)
 	end)
 end
+
+-- Slushie Automation Runner Task
+task.spawn(function()
+	while getgenv().MasterAutoFarmerActive do
+		if not getgenv().FarmerToggles.SlushieActive or not SlushieMachineNet then
+			task.wait(1.0)
+			continue
+		end
+
+		safeCall("SlushieAutomationLoop", function()
+			if not enterSlushieLocationAndVerify() then
+				task.wait(2.0)
+				return
+			end
+
+			print("Starting slushie loop...")
+			while getgenv().MasterAutoFarmerActive and getgenv().FarmerToggles.SlushieActive do
+				local boughtOk, boughtRes = pcall(function()
+					return RouterClient.get("ShopAPI/BuyItem"):InvokeServer("food", CONFIG.SlushieCupKind, {
+						buy_count = 1
+					})
+				end)
+
+				if not boughtOk then
+					task.wait(1)
+					continue
+				end
+
+				task.wait(CONFIG.SlushieTiming.AFTER_BUY)
+
+				local placeOk, placeRes = invokeSlushieRemote(SlushieMachineNet.Place)
+				if not placeOk then
+					task.wait(0.5)
+					continue
+				end
+
+				task.wait(CONFIG.SlushieTiming.AFTER_PLACE)
+
+				local pourSuccess = true
+				for _, flavor in ipairs(CONFIG.SlushieFlavors) do
+					if not getgenv().MasterAutoFarmerActive or not getgenv().FarmerToggles.SlushieActive then break end
+					local firstLetter = string.sub(flavor, 1, 1)
+					local pourOk = invokeSlushieRemote(SlushieMachineNet.Pour, {
+						["color"] = firstLetter
+					})
+					if not pourOk then
+						pourSuccess = false
+						break
+					end
+					task.wait(CONFIG.SlushieTiming.BETWEEN_POURS)
+				end
+
+				if not pourSuccess then
+					task.wait(0.5)
+					continue
+				end
+
+				task.wait(CONFIG.SlushieTiming.BEFORE_TAKE)
+				
+				local taken = false
+				for _ = 1, 3 do
+					local takeOk = invokeSlushieRemote(SlushieMachineNet.Take)
+					if takeOk then
+						taken = true
+						addLogEntry("🥤 Claimed Slushie Successfully!", Color3.fromRGB(100, 200, 255))
+						break
+					end
+					task.wait(CONFIG.SlushieTiming.TAKE_RETRY_DELAY)
+				end
+
+				task.wait(CONFIG.SlushieTiming.CYCLE_COOLDOWN)
+			end
+		end)
+
+		task.wait(2.0)
+	end
+end)
 
 task.spawn(function()
 	safeCall("LightningListeners", function()
