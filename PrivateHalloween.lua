@@ -18,7 +18,6 @@ getgenv().FarmerToggles = {
 	CommitPenActive = true,
 	BottlesActive = false,
 	CauldronActive = false,
-	SlushieActive = false,
 	SelectedBait = "cake"
 }
 
@@ -28,7 +27,6 @@ local ToggleStates = {
 	CommitPenActive = true,
 	BottlesActive = false,
 	CauldronActive = false,
-	SlushieActive = false,
 }
 
 local labels = {}
@@ -106,10 +104,267 @@ pcall(function()
 	end
 end)
 
-local SlushieMachineNet = nil
-pcall(function()
-	SlushieMachineNet = require(replicatedStorage.SharedModules.ContentPacks.Slushie2026.Game.SlushieMachineNet)
-end)
+local gameFolder = replicatedStorage.SharedModules.ContentPacks.Slushie2026.Game
+local SlushieMachineNet = require(gameFolder.SlushieMachineNet)
+local SlushieRecipes = require(gameFolder.SlushieRecipes)
+
+local CUP_KIND = "slushie_2026_cup"
+
+local TIMING = {
+	AFTER_BUY = 0.35,
+	AFTER_PLACE = 0.4,
+	BETWEEN_POURS = 0.35,
+	BEFORE_TAKE = 0.4,
+	TAKE_RETRY_DELAY = 0.35,
+	CYCLE_COOLDOWN = 0.5
+}
+
+local COLOR_NAMES = {
+	B = "Blue",
+	G = "Green",
+	O = "Orange",
+	R = "Red"
+}
+
+local isRunning = false
+local automationThread = nil
+local recipeStatuses = {}
+local recipeEntries = {}
+
+local function getValidMixSequences()
+	local sequences = {}
+	if SlushieRecipes.MIX_ORDER and #SlushieRecipes.MIX_ORDER > 0 then
+		for _, mixKey in ipairs(SlushieRecipes.MIX_ORDER) do
+			local flavors = {}
+			for i = 1, #mixKey do
+				local letter = string.sub(mixKey, i, i)
+				table.insert(flavors, COLOR_NAMES[letter] or letter)
+			end
+			
+			local recipeInfo = (SlushieRecipes.RECIPES and SlushieRecipes.RECIPES[mixKey])
+				or (SlushieRecipes.get and SlushieRecipes.get(mixKey))
+			local displayName = typeof(recipeInfo) == "table" and (recipeInfo.name or recipeInfo.title or recipeInfo.kind) or mixKey
+
+			table.insert(sequences, {
+				mixKey = mixKey,
+				flavors = flavors,
+				displayName = displayName
+			})
+		end
+	else
+		table.insert(sequences, {
+			mixKey = "BGOR",
+			flavors = { "Blue", "Green", "Orange", "Red" },
+			displayName = "Default Mix"
+		})
+	end
+	return sequences
+end
+
+recipeEntries = getValidMixSequences()
+
+local function fireRemote(remoteName, ...)
+	local ok, remote = pcall(function()
+		return RouterClient.get(remoteName)
+	end)
+	if ok and remote then
+		remote:FireServer(...)
+	end
+end
+
+local function invokeRemote(remote, data)
+	local success, result = pcall(function()
+		return if data ~= nil then remote:invoke_server_async(data) else remote:invoke_server_async()
+	end)
+
+	if not success then
+		return false
+	end
+
+	if type(result) == "table" and type(result.await) == "function" then
+		local ok, resolved = result:await()
+		return ok, resolved
+	end
+
+	return true, result
+end
+
+local function updateRecipeStatus(index, statusText, color)
+	local label = recipeStatuses[index]
+	if label then
+		label.Text = statusText
+		label.TextColor3 = color
+	end
+end
+
+local function safeTeleport(rootPart, targetCFrame)
+	safeCall("SafeTeleport", function()
+		if not rootPart or not rootPart.Parent then return end
+		rootPart.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+		rootPart.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+		rootPart.CFrame = targetCFrame
+		rootPart.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+		rootPart.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+	end)
+end
+
+local function teleportAndVerify()
+	local character = player.Character or player.CharacterAdded:Wait()
+	local rootPart = character:WaitForChild("HumanoidRootPart", 10)
+	if not rootPart then return false end
+
+	local interiors = workspace:WaitForChild("Interiors", 15)
+	local mainMapFolder = nil
+
+	local startTime = tick()
+	while not mainMapFolder and isRunning do
+		for _, child in ipairs(interiors:GetChildren()) do
+			if child.Name == "MainMap!Default" or child.Name:find("MainMap") then
+				mainMapFolder = child
+				break
+			end
+		end
+
+		if not mainMapFolder then
+			local destination = "MainMap"
+			local subDestination = "MainDoor"
+
+			fireRemote("AdoptAPI/SendPassiveDoorEnter", destination, subDestination, {})
+			pcall(function()
+				local locationObj = Location.new(destination, subDestination, {})
+				if locationObj then
+					fireRemote("LocationAPI/SetLocation", locationObj.destination_id, locationObj.house_owner, locationObj.sub_destination_id)
+				else
+					fireRemote("LocationAPI/SetLocation", destination, nil, subDestination)
+				end
+			end)
+
+			if InteriorsM and type(InteriorsM.enter) == "function" then
+				pcall(function()
+					InteriorsM.enter(destination, subDestination, {})
+				end)
+			end
+		end
+
+		task.wait(0.5)
+		if tick() - startTime > 25 then
+			break
+		end
+	end
+
+	if not mainMapFolder or not isRunning then return false end
+
+	local blocker = mainMapFolder:WaitForChild("SlushieVehicleBlocker", 15)
+	if not blocker or not isRunning then
+		blocker = mainMapFolder:FindFirstChild("SlushieVehicleBlocker")
+		if not blocker then return false end
+	end
+
+	pcall(function()
+		safeTeleport(rootPart, blocker.CFrame + Vector3.new(0, 3, 0))
+	end)
+
+	task.wait(0.5)
+	return true
+end
+
+local function buyCup()
+	local ok, res = pcall(function()
+		return RouterClient.get("ShopAPI/BuyItem"):InvokeServer("food", CUP_KIND, {
+			buy_count = 1
+		})
+	end)
+	return ok, res
+end
+
+local function placeCup()
+	return invokeRemote(SlushieMachineNet.Place)
+end
+
+local function pourFlavor(flavorName)
+	local firstLetter = string.sub(flavorName, 1, 1)
+	return invokeRemote(SlushieMachineNet.Pour, {
+		["color"] = firstLetter
+	})
+end
+
+local function takeCup(maxAttempts)
+	local attempts = maxAttempts or 3
+	for _ = 1, attempts do
+		if not isRunning then return false end
+		local ok, res = invokeRemote(SlushieMachineNet.Take)
+		if ok then
+			return true, res
+		end
+		task.wait(TIMING.TAKE_RETRY_DELAY)
+	end
+	return false
+end
+
+local function startAutomation()
+	if not teleportAndVerify() then
+		isRunning = false
+		return
+	end
+
+	local recipeIndex = 1
+
+	while isRunning do
+		if recipeIndex == 1 then
+			for i = 1, #recipeEntries do
+				updateRecipeStatus(i, "Pending", Color3.fromRGB(150, 150, 150))
+			end
+		end
+
+		local currentRecipe = recipeEntries[recipeIndex]
+		updateRecipeStatus(recipeIndex, "In Progress...", Color3.fromRGB(255, 200, 100))
+
+		local bought = buyCup()
+		if not bought or not isRunning then
+			task.wait(1)
+			continue
+		end
+
+		task.wait(TIMING.AFTER_BUY)
+		if not isRunning then break end
+
+		if not placeCup() or not isRunning then
+			task.wait(0.5)
+			continue
+		end
+
+		task.wait(TIMING.AFTER_PLACE)
+		if not isRunning then break end
+
+		local pourSuccess = true
+		for _, flavor in ipairs(currentRecipe.flavors) do
+			if not isRunning then break end
+			if not pourFlavor(flavor) then
+				pourSuccess = false
+				break
+			end
+			task.wait(TIMING.BETWEEN_POURS)
+		end
+
+		if not isRunning then break end
+		if not pourSuccess then
+			updateRecipeStatus(recipeIndex, "Failed", Color3.fromRGB(255, 100, 100))
+			task.wait(0.5)
+			recipeIndex = (recipeIndex % #recipeEntries) + 1
+			continue
+		end
+
+		task.wait(TIMING.BEFORE_TAKE)
+		if takeCup(3) then
+			updateRecipeStatus(recipeIndex, "Completed", Color3.fromRGB(100, 255, 100))
+		else
+			updateRecipeStatus(recipeIndex, "Failed (Take)", Color3.fromRGB(255, 100, 100))
+		end
+
+		recipeIndex = (recipeIndex % #recipeEntries) + 1
+		task.wait(TIMING.CYCLE_COOLDOWN)
+	end
+end
 
 local processedPositions = {}
 local totalRewardsClaimed = 0
@@ -125,79 +380,11 @@ local CONFIG = {
 	DefaultBaitDuration = 7200,
 	MaxPetStage = 6,
 	PenSlotCount = 4,
-	SlushieFlavors = { "Blue", "Green", "Orange", "Red" },
-	SlushieCupKind = "slushie_2026_cup",
-	SlushieTiming = {
-		AFTER_BUY = 0.35,
-		AFTER_PLACE = 0.4,
-		BETWEEN_POURS = 0.35,
-		BEFORE_TAKE = 0.4,
-		TAKE_RETRY_DELAY = 0.35,
-		CYCLE_COOLDOWN = 0.5
-	},
 	Baits = {
 		cookie = { kind = "lightning_dimension_2026_cookie_bait", category = "food" },
 		cake = { kind = "lightning_dimension_2026_cake_bait", category = "food" }
 	}
 }
-
-local function fireRemote(apiPath, ...)
-	if not RouterClient then return end
-	local args = {...}
-	pcall(function()
-		local remote = RouterClient.get(apiPath)
-		if remote then
-			if type(remote) == "table" or typeof(remote) == "Instance" then
-				if remote.FireServer then
-					remote:FireServer(unpack(args))
-				elseif remote.fireServer then
-					remote:fireServer(unpack(args))
-				elseif remote.fire_server then
-					remote:fire_server(unpack(args))
-				end
-			end
-		end
-	end)
-end
-
-local function invokeRemote(apiPath, ...)
-	if not RouterClient then return nil end
-	local args = {...}
-	local res = nil
-	pcall(function()
-		local remote = RouterClient.get(apiPath)
-		if remote then
-			if type(remote) == "table" or typeof(remote) == "Instance" then
-				if remote.InvokeServer then
-					res = remote:InvokeServer(unpack(args))
-				elseif remote.invokeServer then
-					res = remote:invokeServer(unpack(args))
-				elseif remote.invoke_server_async then
-					res = remote:invoke_server_async(unpack(args))
-				end
-			end
-		end
-	end)
-	return res
-end
-
-local function invokeSlushieRemote(remote, data)
-	if not remote then return false, nil end
-	local success, result = pcall(function()
-		return if data ~= nil then remote:invoke_server_async(data) else remote:invoke_server_async()
-	end)
-
-	if not success then
-		return false, result
-	end
-
-	if type(result) == "table" and type(result.await) == "function" then
-		local ok, resolved = result:await()
-		return ok, resolved
-	end
-
-	return true, result
-end
 
 local DailiesNetService = nil
 pcall(function()
@@ -256,17 +443,6 @@ coroutine.wrap(function()
 	end
 end)()
 
-local function safeTeleport(rootPart, targetCFrame)
-	safeCall("SafeTeleport", function()
-		if not rootPart or not rootPart.Parent then return end
-		rootPart.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-		rootPart.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
-		rootPart.CFrame = targetCFrame
-		rootPart.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-		rootPart.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
-	end)
-end
-
 local function safeTakeBottle()
 	safeCall("SafeTakeBottle", function()
 		if lightningNet and type(lightningNet.TakeBottle) == "table" and type(lightningNet.TakeBottle.invoke_server_async) == "function" then
@@ -275,110 +451,12 @@ local function safeTakeBottle()
 	end)
 end
 
-local function getTargetCFrame(instance)
-	if instance:IsA("BasePart") then
-		return instance.CFrame
-	elseif instance:IsA("Model") then
-		return instance:GetPivot()
-	end
-	local part = instance:FindFirstChildWhichIsA("BasePart", true)
-	return part and part.CFrame or nil
-end
-
-local function spawnPlatformAt(targetCFrame)
-	local existing = workspace:FindFirstChild("TestLocationPlatform")
-	if existing then
-		existing:Destroy()
-	end
-
-	local platform = Instance.new("Part")
-	platform.Name = "TestLocationPlatform"
-	platform.Size = Vector3.new(25, 1, 25)
-	platform.Anchored = true
-	platform.CanCollide = true
-	platform.Material = Enum.Material.SmoothPlastic
-	platform.Color = Color3.fromRGB(70, 140, 220)
-	-- Moved down further (-4.5 studs below target)
-	platform.CFrame = targetCFrame * CFrame.new(0, -4.5, 0)
-	platform.Parent = workspace
-
-	return platform
-end
-
-local function enterSlushieLocationAndVerify()
-	local character = player.Character or player.CharacterAdded:Wait()
-	local rootPart = character:WaitForChild("HumanoidRootPart", 10)
-	if not rootPart then return false end
-
-	spawnPlatformAt(rootPart.CFrame)
-
-	local interiors = workspace:WaitForChild("Interiors", 15)
-	local mainMapFolder = interiors and interiors:FindFirstChild("MainMap!Default")
-
-	if not mainMapFolder then
-		local destination = "MainMap"
-		local subDestination = "MainDoor"
-
-		fireRemote("AdoptAPI/SendPassiveDoorEnter", destination, subDestination, {})
-		local ok, locationObj = pcall(function()
-			return Location.new(destination, subDestination, {})
-		end)
-
-		if ok and locationObj then
-			fireRemote("LocationAPI/SetLocation", locationObj.destination_id, locationObj.house_owner, locationObj.sub_destination_id)
-		else
-			fireRemote("LocationAPI/SetLocation", destination, nil, subDestination)
-		end
-
-		if InteriorsM and type(InteriorsM.enter) == "function" then
-			pcall(function()
-				InteriorsM.enter(destination, subDestination, {})
-			end)
-		end
-
-		repeat
-			mainMapFolder = interiors and interiors:FindFirstChild("MainMap!Default")
-			task.wait(0.1)
-		until mainMapFolder or not getgenv().MasterAutoFarmerActive or not getgenv().FarmerToggles.SlushieActive
-	end
-
-	if not mainMapFolder then return false end
-
-	local blocker = mainMapFolder:WaitForChild("SlushieVehicleBlocker", 15)
-	if not blocker then return false end
-
-	local blockerCFrame = getTargetCFrame(blocker)
-	if not blockerCFrame then return false end
-
-	local standCFrame = blockerCFrame * CFrame.new(0, 5, 0)
-	spawnPlatformAt(standCFrame)
-
-	local arrived = false
-	for attempt = 1, 20 do
-		if not getgenv().MasterAutoFarmerActive or not getgenv().FarmerToggles.SlushieActive then break end
-		rootPart.AssemblyLinearVelocity = Vector3.zero
-		rootPart.CFrame = standCFrame
-		task.wait(0.1)
-
-		local dist = (rootPart.Position - standCFrame.Position).Magnitude
-		if dist < 10 then
-			arrived = true
-			break
-		end
-	end
-
-	if not arrived then return false end
-	task.wait(0.5)
-	return true
-end
-
 local function enterLightningDimension()
 	if hasEnteredDimension then return end
 	hasEnteredDimension = true
 
 	safeCall("EnterLightningDimension", function()
 		fireRemote("AdoptAPI/SendPassiveDoorEnter", "LightningDimension", "MainDoor", {})
-
 		task.wait(0.2)
 
 		local locationObj = Location.new("LightningDimension", "MainDoor", {})
@@ -461,7 +539,6 @@ local function enterLightningDimension()
 				platform.Color = Color3.fromRGB(35, 35, 45)
 				platform.Parent = gameFolder
 				
-				-- Moved down further (-4.0 studs offset)
 				safeTeleport(rootPart, platform.CFrame + Vector3.new(0, 4.0, 0))
 				task.wait(0.5)
 				safeTakeBottle()
@@ -528,14 +605,12 @@ local function getRainbowColor(offset)
 	return Color3.new(r, g, b)
 end
 
-local screenGui = nil
-
 local function createUI()
 	local existingUi = playerGui:FindFirstChild("MasterAutoFarmerUI")
 	if existingUi then existingUi:Destroy() end
 
-	local UI_WIDTH = 360
-	local UI_HEIGHT = 480
+	local UI_WIDTH = 380
+	local UI_HEIGHT = 500
 	local HEADER_HEIGHT = 44
 
 	local gui = Instance.new("ScreenGui")
@@ -543,7 +618,6 @@ local function createUI()
 	gui.ResetOnSpawn = false
 	gui.ZIndexBehavior = Enum.ZIndexBehavior.Global
 	gui.Parent = playerGui
-	screenGui = gui
 
 	local mainFrame = Instance.new("Frame")
 	mainFrame.Name = "MainFrame"
@@ -645,13 +719,13 @@ local function createUI()
 	local function createTabButton(name, labelText, xPos, width, activeCol, inactiveCol)
 		local btn = Instance.new("TextButton")
 		btn.Name = name .. "TabBtn"
-		btn.Size = UDim2.new(0, width, 0, 34)
-		btn.Position = UDim2.new(0, xPos, 0, 5)
+		btn.Size = UDim2.new(0, width, 0, 32)
+		btn.Position = UDim2.new(0, xPos, 0, 6)
 		btn.BackgroundColor3 = activeCol
 		btn.BorderSizePixel = 0
 		btn.Text = labelText
 		btn.Font = Enum.Font.SourceSansBold
-		btn.TextSize = 15
+		btn.TextSize = 13
 		btn.TextColor3 = Color3.fromRGB(15, 15, 15)
 		btn.Parent = mainFrame
 
@@ -670,9 +744,10 @@ local function createUI()
 		end)
 	end
 
-	createTabButton("Status", "STATUS", 12, 86, Color3.fromRGB(0, 185, 0), Color3.fromRGB(0, 95, 0))
-	createTabButton("Toggles", "TOGGLES", 104, 86, Color3.fromRGB(215, 25, 15), Color3.fromRGB(110, 20, 15))
-	createTabButton("Extra", "EXTRA", 196, 90, Color3.fromRGB(15, 150, 240), Color3.fromRGB(15, 75, 125))
+	createTabButton("Status", "STATUS", 10, 74, Color3.fromRGB(0, 185, 0), Color3.fromRGB(0, 95, 0))
+	createTabButton("Toggles", "TOGGLES", 88, 78, Color3.fromRGB(215, 25, 15), Color3.fromRGB(110, 20, 15))
+	createTabButton("Slushie", "SLUSHIE", 170, 78, Color3.fromRGB(200, 140, 0), Color3.fromRGB(110, 75, 0))
+	createTabButton("Extra", "EXTRA", 252, 64, Color3.fromRGB(15, 150, 240), Color3.fromRGB(15, 75, 125))
 
 	local contentArea = Instance.new("Frame")
 	contentArea.Name = "ContentArea"
@@ -902,9 +977,146 @@ local function createUI()
 		getgenv().FarmerToggles.CauldronActive = val
 	end)
 
-	addSwitchToggle("SlushieActive", "🥤 Slushie Maker", "Auto-buy, place, pour flavors, and take slushies", function(val)
-		getgenv().FarmerToggles.SlushieActive = val
+	-- Slushie Tab Page
+	local slushiePage = createTabPage("Slushie")
+
+	local mainFrameSlushie = Instance.new("Frame")
+	mainFrameSlushie.Size = UDim2.new(1, -6, 0, 390)
+	mainFrameSlushie.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
+	mainFrameSlushie.BorderSizePixel = 0
+	mainFrameSlushie.Parent = slushiePage
+
+	local cornerSlushie = Instance.new("UICorner")
+	cornerSlushie.CornerRadius = UDim.new(0, 8)
+	cornerSlushie.Parent = mainFrameSlushie
+
+	local titleLabel = Instance.new("TextLabel")
+	titleLabel.Size = UDim2.new(1, 0, 0, 40)
+	titleLabel.BackgroundTransparency = 1
+	titleLabel.Text = "Slushie Recipe Status Monitor"
+	titleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+	titleLabel.TextSize = 15
+	titleLabel.Font = Enum.Font.GothamBold
+	titleLabel.Parent = mainFrameSlushie
+
+	local toggleBtn = Instance.new("TextButton")
+	toggleBtn.Size = UDim2.new(0.46, 0, 0, 35)
+	toggleBtn.Position = UDim2.new(0.03, 0, 0, 45)
+	toggleBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
+	toggleBtn.BorderSizePixel = 0
+	toggleBtn.Text = "Status: OFF"
+	toggleBtn.TextColor3 = Color3.fromRGB(255, 100, 100)
+	toggleBtn.TextSize = 13
+	toggleBtn.Font = Enum.Font.GothamMedium
+	toggleBtn.Parent = mainFrameSlushie
+
+	local toggleCorner = Instance.new("UICorner")
+	toggleCorner.CornerRadius = UDim.new(0, 6)
+	toggleCorner.Parent = toggleBtn
+
+	toggleBtn.MouseButton1Click:Connect(function()
+		isRunning = not isRunning
+
+		if isRunning then
+			toggleBtn.Text = "Status: ON"
+			toggleBtn.TextColor3 = Color3.fromRGB(100, 255, 100)
+			toggleBtn.BackgroundColor3 = Color3.fromRGB(40, 80, 50)
+
+			if automationThread then
+				task.cancel(automationThread)
+			end
+			automationThread = task.spawn(startAutomation)
+		else
+			toggleBtn.Text = "Status: OFF"
+			toggleBtn.TextColor3 = Color3.fromRGB(255, 100, 100)
+			toggleBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
+
+			if automationThread then
+				task.cancel(automationThread)
+				automationThread = nil
+			end
+		end
 	end)
+
+	local closeBtnSlushie = Instance.new("TextButton")
+	closeBtnSlushie.Size = UDim2.new(0.46, 0, 0, 35)
+	closeBtnSlushie.Position = UDim2.new(0.51, 0, 0, 45)
+	closeBtnSlushie.BackgroundColor3 = Color3.fromRGB(120, 40, 40)
+	closeBtnSlushie.BorderSizePixel = 0
+	closeBtnSlushie.Text = "Stop Bot"
+	closeBtnSlushie.TextColor3 = Color3.fromRGB(255, 255, 255)
+	closeBtnSlushie.TextSize = 13
+	closeBtnSlushie.Font = Enum.Font.GothamMedium
+	closeBtnSlushie.Parent = mainFrameSlushie
+
+	local closeCornerSlushie = Instance.new("UICorner")
+	closeCornerSlushie.CornerRadius = UDim.new(0, 6)
+	closeCornerSlushie.Parent = closeBtnSlushie
+
+	closeBtnSlushie.MouseButton1Click:Connect(function()
+		isRunning = false
+		toggleBtn.Text = "Status: OFF"
+		toggleBtn.TextColor3 = Color3.fromRGB(255, 100, 100)
+		toggleBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
+		if automationThread then
+			task.cancel(automationThread)
+			automationThread = nil
+		end
+	end)
+
+	local scrollFrame = Instance.new("ScrollingFrame")
+	scrollFrame.Size = UDim2.new(0.94, 0, 0, 290)
+	scrollFrame.Position = UDim2.new(0.03, 0, 0, 88)
+	scrollFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+	scrollFrame.BorderSizePixel = 0
+	scrollFrame.CanvasSize = UDim2.new(0, 0, 0, #recipeEntries * 32)
+	scrollFrame.ScrollBarThickness = 6
+	scrollFrame.Parent = mainFrameSlushie
+
+	local scrollCorner = Instance.new("UICorner")
+	scrollCorner.CornerRadius = UDim.new(0, 6)
+	scrollCorner.Parent = scrollFrame
+
+	local uiListLayout = Instance.new("UIListLayout")
+	uiListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	uiListLayout.Padding = UDim.new(0, 4)
+	uiListLayout.Parent = scrollFrame
+
+	for i, recipe in ipairs(recipeEntries) do
+		local row = Instance.new("Frame")
+		row.Size = UDim2.new(1, 0, 0, 28)
+		row.BackgroundColor3 = Color3.fromRGB(40, 40, 48)
+		row.BorderSizePixel = 0
+		row.Parent = scrollFrame
+
+		local rowCorner = Instance.new("UICorner")
+		rowCorner.CornerRadius = UDim.new(0, 4)
+		rowCorner.Parent = row
+
+		local nameLabel = Instance.new("TextLabel")
+		nameLabel.Size = UDim2.new(0.65, 0, 1, 0)
+		nameLabel.Position = UDim2.new(0.03, 0, 0, 0)
+		nameLabel.BackgroundTransparency = 1
+		nameLabel.Text = string.format("[%s] %s", recipe.mixKey, recipe.displayName)
+		nameLabel.TextColor3 = Color3.fromRGB(220, 220, 220)
+		nameLabel.TextSize = 11
+		nameLabel.Font = Enum.Font.Gotham
+		nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+		nameLabel.Parent = row
+
+		local statusLabel = Instance.new("TextLabel")
+		statusLabel.Size = UDim2.new(0.3, 0, 1, 0)
+		statusLabel.Position = UDim2.new(0.68, 0, 0, 0)
+		statusLabel.BackgroundTransparency = 1
+		statusLabel.Text = "Pending"
+		statusLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
+		statusLabel.TextSize = 11
+		statusLabel.Font = Enum.Font.GothamBold
+		statusLabel.TextXAlignment = Enum.TextXAlignment.Right
+		statusLabel.Parent = row
+
+		recipeStatuses[i] = statusLabel
+	end
 
 	local extraPage = createTabPage("Extra")
 
@@ -942,7 +1154,7 @@ local function createUI()
 	versionLabel.AnchorPoint = Vector2.new(0, 1)
 	versionLabel.Position = UDim2.new(0, 5, 1, -3)
 	versionLabel.BackgroundTransparency = 1
-	versionLabel.Text = "Version: Master Auto-Farm v3.3"
+	versionLabel.Text = "Version: Master Auto-Farm v3.25"
 	versionLabel.TextColor3 = Color3.fromRGB(120, 120, 120)
 	versionLabel.Font = Enum.Font.SourceSans
 	versionLabel.TextSize = 11
@@ -1053,10 +1265,7 @@ end
 
 local function equipToolSilent(itemUniqueId)
 	if not getgenv().MasterAutoFarmerActive then return false end
-	local invokeSuccess = invokeRemote("ToolAPI/Equip", itemUniqueId, {
-		use_sound_delay = false,
-		equip_as_last = false
-	})
+	local invokeSuccess = invokeRemote(RouterClient.get("ToolAPI/Equip"), {itemUniqueId, { use_sound_delay = false, equip_as_last = false }})
 	return invokeSuccess ~= nil
 end
 
@@ -1135,14 +1344,14 @@ local function processCauldronCrafting()
 
 			local recipeKey = (getgenv().FarmerToggles.SelectedBait == "cookie") and "cookie" or "cake"
 
-			invokeRemote("HousingAPI/ActivateInteriorFurniture", furnitureId, "UseBlock", {
+			fireRemote("HousingAPI/ActivateInteriorFurniture", furnitureId, "UseBlock", {
 				["key"] = recipeKey,
 				["item_list"] = {
 					["r_1"] = capturedUniques[1],
 					["r_2"] = capturedUniques[2],
 					["r_3"] = capturedUniques[3]
 				}
-			}, player.Character)
+			})
 			
 			task.wait(1.5)
 			capturedUniques = getCapturedLightningUniques()
@@ -1281,103 +1490,6 @@ local function processBackgroundLure()
 	end)
 end
 
-local function getPetDisplayName(kind)
-	if InventoryDB and type(InventoryDB) == "table" and type(InventoryDB.pets) == "table" and kind and InventoryDB.pets[kind] then
-		return InventoryDB.pets[kind].name or kind
-	end
-	return kind or "Unknown Pet"
-end
-
-local function getUnmaxedPets(count)
-	local inventory = getInventory()
-	if not inventory or type(inventory) ~= "table" and type(inventory.pets) ~= "table" then return {} end
-
-	local selectedPets = {}
-
-	for uniqueId, itemData in pairs(inventory.pets) do
-		if type(itemData) == "table" then
-			local properties = type(itemData.properties) == "table" and itemData.properties or {}
-			local ageStage = properties.age or 1
-			local kind = tostring(itemData.kind or itemData.id or ""):lower()
-
-			local isEgg = kind:find("egg") ~= nil
-			if InventoryDB and type(InventoryDB) == "table" and type(InventoryDB.pets) == "table" and InventoryDB.pets[kind] then
-				if InventoryDB.pets[kind].is_egg then
-					isEgg = true
-				end
-			end
-
-			if kind ~= "" and kind ~= "practice_dog" and not isEgg and ageStage < CONFIG.MaxPetStage then
-				table.insert(selectedPets, {
-					uniqueId = uniqueId,
-					kind = kind,
-					name = getPetDisplayName(kind)
-				})
-				
-				if #selectedPets >= count then
-					break
-				end
-			end
-		end
-	end
-
-	return selectedPets
-end
-
-task.spawn(function()
-	while getgenv().MasterAutoFarmerActive do
-		safeCall("PetPenLoop", function()
-			if not getgenv().FarmerToggles.PetPenActive then return end
-
-			local inventory = getInventory()
-			if not inventory or type(inventory) ~= "table" and type(inventory.pets) ~= "table" then return end
-
-			local progressionData = ClientDataModule.get("idle_progression")
-			if type(progressionData) ~= "table" then progressionData = {} end
-			local activePetsMap = type(progressionData.pets) == "table" and progressionData.pets or (type(progressionData.active_pets) == "table" and progressionData.active_pets or {})
-			
-			for slotIndex, petData in pairs(activePetsMap) do
-				local uniqueId = type(petData) == "table" and (petData.unique_id or petData.uniqueId) or tostring(petData)
-				if uniqueId and inventory.pets[uniqueId] then
-					local itemData = inventory.pets[uniqueId]
-					if type(itemData) == "table" then
-						local properties = type(itemData.properties) == "table" and itemData.properties or {}
-						local ageStage = properties.age or 1
-
-						if ageStage >= CONFIG.MaxPetStage then
-							fireRemote("IdleProgressionAPI/RemovePet", uniqueId)
-							addLogEntry("🐾 Removed Full-Grown Pet from Pen", Color3.new(1, 0.5, 1))
-							task.wait(0.5)
-						end
-					end
-				end
-			end
-
-			if getgenv().FarmerToggles.PetPenActive then
-				local targetPets = getUnmaxedPets(CONFIG.PenSlotCount)
-				for slotIndex, petInfo in ipairs(targetPets) do
-					if not getgenv().FarmerToggles.PetPenActive then break end
-					fireRemote("IdleProgressionAPI/AddPet", petInfo.uniqueId)
-					task.wait(0.5)
-				end
-			end
-		end)
-
-		task.wait(4.0)
-	end
-end)
-
-task.spawn(function()
-	while getgenv().MasterAutoFarmerActive do
-		safeCall("CommitPenLoop", function()
-			if not getgenv().FarmerToggles.CommitPenActive then return end
-			fireRemote("IdleProgressionAPI/CommitAllProgression")
-		end)
-
-		task.wait(3.0)
-	end
-end)
-
 local function getInventoryBottleStatus()
 	local playerData = getInventory()
 	local forkedBottles = {}
@@ -1386,9 +1498,10 @@ local function getInventoryBottleStatus()
 	if playerData and type(playerData) == "table" and type(playerData.toys) == "table" then
 		for uniqueId, itemData in pairs(playerData.toys) do
 			if type(itemData) == "table" then
-				if itemData.id == CONFIG.ForkedBottleKind then
+				local itemId = tostring(itemData.kind or itemData.id or "")
+				if itemId == CONFIG.ForkedBottleKind or itemId:find("forked_bottle") then
 					table.insert(forkedBottles, uniqueId)
-				elseif itemData.id == CONFIG.CapturedLightningKind then
+				elseif itemId == CONFIG.CapturedLightningKind or itemId:find("captured_lightning") then
 					capturedCount = capturedCount + 1
 				end
 			end
@@ -1439,13 +1552,13 @@ local function triggerBottlePlacement(strikePos)
 		local currentTime = tick()
 
 		for pos, timestamp in pairs(processedPositions) do
-			if currentTime - timestamp > 3.0 then
+			if currentTime - timestamp > 4.0 then
 				processedPositions[pos] = nil
 			end
 		end
 
 		for pos, _ in pairs(processedPositions) do
-			if (pos - strikePos).Magnitude < 12 then
+			if (pos - strikePos).Magnitude < 10 then
 				return
 			end
 		end
@@ -1473,95 +1586,25 @@ local function triggerBottlePlacement(strikePos)
 		equipToolSilent(bottleUniqueId)
 		task.wait(0.15)
 
-		if lightningNet and type(lightningNet.PlaceBottle) == "table" and type(lightningNet.PlaceBottle.invoke_server_async) == "function" then
+		if lightningNet and type(lightningNet.PlaceBottle) == "table" then
 			pcall(function()
-				return lightningNet.PlaceBottle:invoke_server_async({
-					unique = bottleUniqueId,
-					position = strikePos
-				})
+				if type(lightningNet.PlaceBottle.invoke_server_async) == "function" then
+					lightningNet.PlaceBottle:invoke_server_async({
+						["unique"] = bottleUniqueId,
+						["position"] = strikePos
+					})
+				elseif type(lightningNet.PlaceBottle.InvokeServer) == "function" then
+					lightningNet.PlaceBottle:InvokeServer({
+						["unique"] = bottleUniqueId,
+						["position"] = strikePos
+					})
+				end
 			end)
 		end
 
 		task.wait(CONFIG.WaitTimeForCharge)
 	end)
 end
-
--- Slushie Automation Runner Task
-task.spawn(function()
-	while getgenv().MasterAutoFarmerActive do
-		if not getgenv().FarmerToggles.SlushieActive or not SlushieMachineNet then
-			task.wait(1.0)
-			continue
-		end
-
-		safeCall("SlushieAutomationLoop", function()
-			if not enterSlushieLocationAndVerify() then
-				task.wait(2.0)
-				return
-			end
-
-			print("Starting slushie loop...")
-			while getgenv().MasterAutoFarmerActive and getgenv().FarmerToggles.SlushieActive do
-				local boughtOk, boughtRes = pcall(function()
-					return RouterClient.get("ShopAPI/BuyItem"):InvokeServer("food", CONFIG.SlushieCupKind, {
-						buy_count = 1
-					})
-				end)
-
-				if not boughtOk then
-					task.wait(1)
-					continue
-				end
-
-				task.wait(CONFIG.SlushieTiming.AFTER_BUY)
-
-				local placeOk, placeRes = invokeSlushieRemote(SlushieMachineNet.Place)
-				if not placeOk then
-					task.wait(0.5)
-					continue
-				end
-
-				task.wait(CONFIG.SlushieTiming.AFTER_PLACE)
-
-				local pourSuccess = true
-				for _, flavor in ipairs(CONFIG.SlushieFlavors) do
-					if not getgenv().MasterAutoFarmerActive or not getgenv().FarmerToggles.SlushieActive then break end
-					local firstLetter = string.sub(flavor, 1, 1)
-					local pourOk = invokeSlushieRemote(SlushieMachineNet.Pour, {
-						["color"] = firstLetter
-					})
-					if not pourOk then
-						pourSuccess = false
-						break
-					end
-					task.wait(CONFIG.SlushieTiming.BETWEEN_POURS)
-				end
-
-				if not pourSuccess then
-					task.wait(0.5)
-					continue
-				end
-
-				task.wait(CONFIG.SlushieTiming.BEFORE_TAKE)
-				
-				local taken = false
-				for _ = 1, 3 do
-					local takeOk = invokeSlushieRemote(SlushieMachineNet.Take)
-					if takeOk then
-						taken = true
-						addLogEntry("🥤 Claimed Slushie Successfully!", Color3.fromRGB(100, 200, 255))
-						break
-					end
-					task.wait(CONFIG.SlushieTiming.TAKE_RETRY_DELAY)
-				end
-
-				task.wait(CONFIG.SlushieTiming.CYCLE_COOLDOWN)
-			end
-		end)
-
-		task.wait(2.0)
-	end
-end)
 
 task.spawn(function()
 	safeCall("LightningListeners", function()
@@ -1607,12 +1650,16 @@ task.spawn(function()
 		end
 
 		safeCall("WorkspaceStrikeScan", function()
-			for _, obj in ipairs(workspace:GetDescendants()) do
-				if not getgenv().MasterAutoFarmerActive or not getgenv().FarmerToggles.BottlesActive then break end
+			local interiors = workspace:FindFirstChild("Interiors")
+			local lightningDim = interiors and interiors:FindFirstChild("LightningDimension")
+			if lightningDim then
+				for _, obj in ipairs(lightningDim:GetDescendants()) do
+					if not getgenv().MasterAutoFarmerActive or not getgenv().FarmerToggles.BottlesActive then break end
 
-				if obj:IsA("BasePart") and (obj.Name == "LightningDimension2026StrikeWarning" or obj.Name == "LightningDimension2026Strike") then
-					local exactCenterPos = obj.CFrame.Position
-					triggerBottlePlacement(exactCenterPos)
+					if obj:IsA("BasePart") and (obj.Name == "LightningDimension2026StrikeWarning" or obj.Name == "LightningDimension2026Strike") then
+						local exactCenterPos = obj.CFrame.Position
+						triggerBottlePlacement(exactCenterPos)
+					end
 				end
 			end
 		end)
