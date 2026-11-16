@@ -1,4 +1,4 @@
-print("LOADED")
+print("WORKS")
 
 -----------------------------------------------------------
 -- ULTIMATE ADOPT ME! AUTOMATION & TELEPORT HUB (COMPLETE WITH DIALOG LOGIC)
