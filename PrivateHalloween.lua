@@ -1,4 +1,5 @@
-print("LOADING")
+print("LOADED")
+
 
 local replicatedStorage = game:GetService("ReplicatedStorage")
 local players = game:GetService("Players")
