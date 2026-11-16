@@ -1,7 +1,7 @@
 print("LOADED")
 
 -----------------------------------------------------------
--- ULTIMATE ADOPT ME! AUTOMATION & TELEPORT HUB (FINAL FIXED)
+-- ULTIMATE ADOPT ME! AUTOMATION & TELEPORT HUB (COMPLETE WITH DIALOG LOGIC)
 -----------------------------------------------------------
 task.spawn(function()
     pcall(function()
@@ -35,7 +35,7 @@ task.spawn(function()
             if not Fsys then task.wait(1) end
         end
 
-        local ClientData, Router, StateManager, AilmentsManager = nil, nil, nil, nil
+        local ClientData, Router, StateManager, AilmentsManager, UIManager = nil, nil, nil, nil, nil
         while not (ClientData and Router and AilmentsManager) do
             pcall(function()
                 if Fsys and Fsys.load then
@@ -43,6 +43,7 @@ task.spawn(function()
                     Router = Router or Fsys.load("RouterClient")
                     StateManager = StateManager or Fsys.load("StateManagerClient")
                     AilmentsManager = AilmentsManager or Fsys.load("new:AilmentsClient")
+                    UIManager = UIManager or Fsys.load("UIManager")
                 end
             end)
             if not (ClientData and Router and AilmentsManager) then task.wait(1) end
@@ -631,7 +632,7 @@ task.spawn(function()
         btnCorner.Parent = heavyButton
 
         -----------------------------------------------------------
-        -- DIALOG INTERCEPTOR
+        -- DIALOG INTERCEPTOR (RESTORED)
         -----------------------------------------------------------
         local DialogApp = UIManager and UIManager.apps and UIManager.apps.DialogApp
         local OriginalDialogFunc = DialogApp and DialogApp.dialog
