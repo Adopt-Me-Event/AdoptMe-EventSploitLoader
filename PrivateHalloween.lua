@@ -1,4 +1,5 @@
 print("LOADING")
+
 local replicatedStorage = game:GetService("ReplicatedStorage")
 local players = game:GetService("Players")
 local runService = game:GetService("RunService")
@@ -18,6 +19,7 @@ getgenv().FarmerToggles = {
 	CommitPenActive = true,
 	BottlesActive = false,
 	CauldronActive = false,
+	SlushieDrinkActive = false,
 	SelectedBait = "cake"
 }
 
@@ -27,6 +29,7 @@ local ToggleStates = {
 	CommitPenActive = true,
 	BottlesActive = false,
 	CauldronActive = false,
+	SlushieDrinkActive = false,
 }
 
 local labels = {}
@@ -108,6 +111,11 @@ local gameFolder = replicatedStorage.SharedModules.ContentPacks.Slushie2026.Game
 local SlushieMachineNet = require(gameFolder.SlushieMachineNet)
 local SlushieRecipes = require(gameFolder.SlushieRecipes)
 
+local slushieDrankRemote = nil
+pcall(function()
+	slushieDrankRemote = replicatedStorage:WaitForChild("adoptme_new_net", 3):WaitForChild("Slushie2026/SlushieDrank", 3)
+end)
+
 local CUP_KIND = "slushie_2026_cup"
 
 local TIMING = {
@@ -116,7 +124,9 @@ local TIMING = {
 	BETWEEN_POURS = 0.35,
 	BEFORE_TAKE = 0.4,
 	TAKE_RETRY_DELAY = 0.35,
-	CYCLE_COOLDOWN = 0.5
+	CYCLE_COOLDOWN = 0.5,
+	DRINK_START_TO_END = 0.15,
+	DRINK_COOLDOWN = 0.5
 }
 
 local COLOR_NAMES = {
@@ -367,6 +377,7 @@ local function startAutomation()
 end
 
 local processedPositions = {}
+local processedSlushieIds = {}
 local totalRewardsClaimed = 0
 local isManagingLure = false
 local lureLockTimestamp = 0
@@ -389,6 +400,11 @@ local CONFIG = {
 local DailiesNetService = nil
 pcall(function()
 	DailiesNetService = require(replicatedStorage.new.modules.Dailies.DailiesNetService)
+end)
+
+local PetPenNet = nil
+pcall(function()
+	PetPenNet = require(replicatedStorage.SharedModules.ContentPacks.PetPen2024.PetPenNet)
 end)
 
 local lightningNet = nil
@@ -609,7 +625,7 @@ local function createUI()
 	local existingUi = playerGui:FindFirstChild("MasterAutoFarmerUI")
 	if existingUi then existingUi:Destroy() end
 
-	local UI_WIDTH = 380
+	local UI_WIDTH = 420
 	local UI_HEIGHT = 500
 	local HEADER_HEIGHT = 44
 
@@ -725,7 +741,7 @@ local function createUI()
 		btn.BorderSizePixel = 0
 		btn.Text = labelText
 		btn.Font = Enum.Font.SourceSansBold
-		btn.TextSize = 13
+		btn.TextSize = 12
 		btn.TextColor3 = Color3.fromRGB(15, 15, 15)
 		btn.Parent = mainFrame
 
@@ -744,10 +760,11 @@ local function createUI()
 		end)
 	end
 
-	createTabButton("Status", "STATUS", 10, 74, Color3.fromRGB(0, 185, 0), Color3.fromRGB(0, 95, 0))
-	createTabButton("Toggles", "TOGGLES", 88, 78, Color3.fromRGB(215, 25, 15), Color3.fromRGB(110, 20, 15))
-	createTabButton("Slushie", "SLUSHIE", 170, 78, Color3.fromRGB(200, 140, 0), Color3.fromRGB(110, 75, 0))
-	createTabButton("Extra", "EXTRA", 252, 64, Color3.fromRGB(15, 150, 240), Color3.fromRGB(15, 75, 125))
+	createTabButton("Status", "STATUS", 8, 64, Color3.fromRGB(0, 185, 0), Color3.fromRGB(0, 95, 0))
+	createTabButton("Toggles", "TOGGLES", 76, 68, Color3.fromRGB(215, 25, 15), Color3.fromRGB(110, 20, 15))
+	createTabButton("Slushie", "SLUSHIE", 148, 68, Color3.fromRGB(200, 140, 0), Color3.fromRGB(110, 75, 0))
+	createTabButton("Drinker", "DRINKER", 220, 68, Color3.fromRGB(140, 40, 200), Color3.fromRGB(70, 20, 100))
+	createTabButton("Extra", "EXTRA", 292, 60, Color3.fromRGB(15, 150, 240), Color3.fromRGB(15, 75, 125))
 
 	local contentArea = Instance.new("Frame")
 	contentArea.Name = "ContentArea"
@@ -958,7 +975,7 @@ local function createUI()
 		end
 	end)
 
-	addSwitchToggle("PetPenActive", "🐾 Pet Pen Manager", "Manage active growing pets (excludes eggs/practice dogs)", function(val)
+	addSwitchToggle("PetPenActive", "🐾 Pet Pen Manager", "Manage active growing pets & auto-claim", function(val)
 		getgenv().FarmerToggles.PetPenActive = val
 	end)
 
@@ -1118,6 +1135,68 @@ local function createUI()
 		recipeStatuses[i] = statusLabel
 	end
 
+	-- Drinker Tab Page
+	local drinkerPage = createTabPage("Drinker")
+
+	local mainFrameDrinker = Instance.new("Frame")
+	mainFrameDrinker.Size = UDim2.new(1, -6, 0, 200)
+	mainFrameDrinker.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
+	mainFrameDrinker.BorderSizePixel = 0
+	mainFrameDrinker.Parent = drinkerPage
+
+	local cornerDrinker = Instance.new("UICorner")
+	cornerDrinker.CornerRadius = UDim.new(0, 8)
+	cornerDrinker.Parent = mainFrameDrinker
+
+	local titleLabelDrinker = Instance.new("TextLabel")
+	titleLabelDrinker.Size = UDim2.new(1, 0, 0, 40)
+	titleLabelDrinker.BackgroundTransparency = 1
+	titleLabelDrinker.Text = "Slushie Auto-Drinker (Journal Filler)"
+	titleLabelDrinker.TextColor3 = Color3.fromRGB(255, 255, 255)
+	titleLabelDrinker.TextSize = 13
+	titleLabelDrinker.Font = Enum.Font.GothamBold
+	titleLabelDrinker.Parent = mainFrameDrinker
+
+	local toggleDrinkerBtn = Instance.new("TextButton")
+	toggleDrinkerBtn.Size = UDim2.new(0.9, 0, 0, 45)
+	toggleDrinkerBtn.Position = UDim2.new(0.05, 0, 0, 50)
+	toggleDrinkerBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
+	toggleDrinkerBtn.BorderSizePixel = 0
+	toggleDrinkerBtn.Text = "Drinker Status: OFF"
+	toggleDrinkerBtn.TextColor3 = Color3.fromRGB(255, 100, 100)
+	toggleDrinkerBtn.TextSize = 14
+	toggleDrinkerBtn.Font = Enum.Font.GothamBold
+	toggleDrinkerBtn.Parent = mainFrameDrinker
+
+	local toggleDrinkerCorner = Instance.new("UICorner")
+	toggleDrinkerCorner.CornerRadius = UDim.new(0, 6)
+	toggleDrinkerCorner.Parent = toggleDrinkerBtn
+
+	toggleDrinkerBtn.MouseButton1Click:Connect(function()
+		getgenv().FarmerToggles.SlushieDrinkActive = not getgenv().FarmerToggles.SlushieDrinkActive
+
+		if getgenv().FarmerToggles.SlushieDrinkActive then
+			toggleDrinkerBtn.Text = "Drinker Status: ON"
+			toggleDrinkerBtn.TextColor3 = Color3.fromRGB(100, 255, 100)
+			toggleDrinkerBtn.BackgroundColor3 = Color3.fromRGB(40, 80, 50)
+		else
+			toggleDrinkerBtn.Text = "Drinker Status: OFF"
+			toggleDrinkerBtn.TextColor3 = Color3.fromRGB(255, 100, 100)
+			toggleDrinkerBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
+		end
+	end)
+
+	local drinkerInfo = Instance.new("TextLabel")
+	drinkerInfo.Size = UDim2.new(0.9, 0, 0, 60)
+	drinkerInfo.Position = UDim2.new(0.05, 0, 0, 115)
+	drinkerInfo.BackgroundTransparency = 1
+	drinkerInfo.Text = "Consumes crafted slushie cups from inventory automatically to register journal entries."
+	drinkerInfo.TextColor3 = Color3.fromRGB(170, 170, 170)
+	drinkerInfo.TextSize = 12
+	drinkerInfo.Font = Enum.Font.Gotham
+	drinkerInfo.TextWrapped = true
+	drinkerInfo.Parent = mainFrameDrinker
+
 	local extraPage = createTabPage("Extra")
 
 	local function addActionButton(text, color, callback)
@@ -1154,7 +1233,7 @@ local function createUI()
 	versionLabel.AnchorPoint = Vector2.new(0, 1)
 	versionLabel.Position = UDim2.new(0, 5, 1, -3)
 	versionLabel.BackgroundTransparency = 1
-	versionLabel.Text = "Version: Master Auto-Farm v3.25"
+	versionLabel.Text = "Version: Master Auto-Farm v3.27"
 	versionLabel.TextColor3 = Color3.fromRGB(120, 120, 120)
 	versionLabel.Font = Enum.Font.SourceSans
 	versionLabel.TextSize = 11
@@ -1355,6 +1434,101 @@ local function processCauldronCrafting()
 			
 			task.wait(1.5)
 			capturedUniques = getCapturedLightningUniques()
+		end
+	end)
+end
+
+-- Fixed Pet Pen Automation & Commit All Progression
+local function processPetPenManager()
+	if not getgenv().FarmerToggles.PetPenActive then return end
+
+	safeCall("PetPenManager", function()
+		-- 1. Auto-commit all pending idle progression chunks via direct remote call
+		if getgenv().FarmerToggles.CommitPenActive then
+			fireRemote("IdleProgressionAPI/CommitAllProgression")
+		end
+
+		-- 2. Check individual pet pen slots for claims
+		local profileData = ClientDataModule.get_data()
+		local playerData = profileData and profileData[player.Name]
+		if not playerData or not playerData.pet_pen_2024_manager then return end
+
+		local penManager = playerData.pet_pen_2024_manager
+		local slots = penManager.slots
+
+		if type(slots) ~= "table" then return end
+
+		for slotIndex, slotData in pairs(slots) do
+			if type(slotData) == "table" then
+				local petUnique = slotData.pet_unique
+				local stage = slotData.stage
+
+				if petUnique and stage then
+					if stage >= CONFIG.MaxPetStage or slotData.ready_to_claim then
+						if PetPenNet and type(PetPenNet.ClaimPet) == "table" then
+							pcall(function()
+								PetPenNet.ClaimPet:invoke_server_async(slotIndex)
+							end)
+							addLogEntry("🐾 Claimed fully grown pet from Pet Pen!", Color3.fromRGB(100, 255, 150))
+							task.wait(1.0)
+						end
+					elseif getgenv().FarmerToggles.CommitPenActive and slotData.pending_progression and slotData.pending_progression > 0 then
+						if PetPenNet and type(PetPenNet.CommitProgression) == "table" then
+							pcall(function()
+								PetPenNet.CommitProgression:invoke_server_async(slotIndex)
+							end)
+							task.wait(1.0)
+						end
+					end
+				end
+			end
+		end
+	end)
+end
+
+local function findNextCraftedSlushie()
+	local inventory = getInventory()
+	if not inventory or not inventory.food then return nil, nil, nil end
+	
+	for uId, item in pairs(inventory.food) do
+		if not processedSlushieIds[uId] and type(item) == "table" and (item.id == CUP_KIND or tostring(item.kind) == CUP_KIND) then
+			if item.properties and type(item.properties.sequence) == "string" and item.properties.sequence ~= "" then
+				return uId, item.properties.sequence, item
+			end
+		end
+	end
+	return nil, nil, nil
+end
+
+local function processSlushieDrinking()
+	if not getgenv().FarmerToggles.SlushieDrinkActive then return end
+
+	safeCall("SlushieDrinking", function()
+		local uId, sequence, _ = findNextCraftedSlushie()
+		if uId and sequence then
+			processedSlushieIds[uId] = true
+
+			pcall(function()
+				RouterClient.get("ToolAPI/ServerUseTool"):InvokeServer(uId, "START")
+			end)
+			
+			task.wait(TIMING.DRINK_START_TO_END)
+			
+			pcall(function()
+				RouterClient.get("ToolAPI/ServerUseTool"):InvokeServer(uId, "END")
+			end)
+			
+			if slushieDrankRemote then
+				pcall(function()
+					slushieDrankRemote:FireServer({
+						unique_id = uId,
+						sequence = sequence
+					})
+				end)
+			end
+			
+			addLogEntry("🍹 Drank Slushie Recipe: " .. tostring(sequence), Color3.fromRGB(200, 100, 255))
+			task.wait(TIMING.DRINK_COOLDOWN)
 		end
 	end)
 end
@@ -1629,6 +1803,8 @@ task.spawn(function()
 
 	local lastLureCheck = 0
 	local lastCraftCheck = 0
+	local lastPetCheck = 0
+	local lastDrinkCheck = 0
 
 	while getgenv().MasterAutoFarmerActive do
 		task.wait(0.25)
@@ -1643,6 +1819,18 @@ task.spawn(function()
 		if tick() - lastCraftCheck > 3.0 then
 			lastCraftCheck = tick()
 			safeCall("CauldronCraftingRunner", processCauldronCrafting)
+		end
+
+		if tick() - lastPetCheck > 2.0 then
+			lastPetCheck = tick()
+			safeCall("PetPenRunner", processPetPenManager)
+		end
+
+		if tick() - lastDrinkCheck > 0.5 then
+			lastDrinkCheck = tick()
+			if getgenv().FarmerToggles.SlushieDrinkActive then
+				safeCall("SlushieDrinkRunner", processSlushieDrinking)
+			end
 		end
 
 		if not getgenv().FarmerToggles.BottlesActive then
