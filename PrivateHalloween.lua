@@ -1,13 +1,14 @@
 print("LOADED")
 
 -----------------------------------------------------------
--- ULTIMATE ADOPT ME! AUTOMATION & TELEPORT HUB (WITH ANTI-AFK)
+-- ULTIMATE ADOPT ME! AUTOMATION & TELEPORT HUB (FINAL FIXED)
 -----------------------------------------------------------
 task.spawn(function()
     pcall(function()
         local ReplicatedStorage = game:GetService("ReplicatedStorage")
         local Players = game:GetService("Players")
         local Workspace = game:GetService("Workspace")
+        local RunService = game:GetService("RunService")
         local VirtualUser = game:GetService("VirtualUser")
         local localPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
         local playerGui = localPlayer:WaitForChild("PlayerGui")
@@ -22,33 +23,56 @@ task.spawn(function()
         end)
 
         -- Safe loading of all modules & dependencies
-        local successFsys, Fsys = pcall(function()
-            return require(ReplicatedStorage:WaitForChild("Fsys", 5))
-        end)
-        
-        if not successFsys or not Fsys then
-            warn("[Module Error]: Failed to load Fsys module.")
-            return
+        local Fsys = nil
+        while not Fsys do
+            local success, result = pcall(function()
+                return ReplicatedStorage:WaitForChild("Fsys", 2)
+            end)
+            if success and result then
+                local reqSuccess, reqModule = pcall(function() return require(result) end)
+                if reqSuccess and reqModule then Fsys = reqModule end
+            end
+            if not Fsys then task.wait(1) end
         end
 
-        local load = Fsys.load
-        local ClientData = pcall(function() return load("ClientData") end) and load("ClientData") or nil
-        local RouterClient = pcall(function() return load("RouterClient") end) and load("RouterClient") or nil
-        local FurnitureMannequinsHelper = pcall(function() return load("FurnitureMannequinsHelper") end) and load("FurnitureMannequinsHelper") or nil
-        local UIManager = pcall(function() return load("UIManager") end) and load("UIManager") or nil
+        local ClientData, Router, StateManager, AilmentsManager = nil, nil, nil, nil
+        while not (ClientData and Router and AilmentsManager) do
+            pcall(function()
+                if Fsys and Fsys.load then
+                    ClientData = ClientData or Fsys.load("ClientData")
+                    Router = Router or Fsys.load("RouterClient")
+                    StateManager = StateManager or Fsys.load("StateManagerClient")
+                    AilmentsManager = AilmentsManager or Fsys.load("new:AilmentsClient")
+                end
+            end)
+            if not (ClientData and Router and AilmentsManager) then task.wait(1) end
+        end
 
-        local successLoc, DynamicLocationDB = pcall(function()
-            return require(ReplicatedStorage.ClientDB.DynamicLocationDB)
-        end)
-
-        -- State Variables
+        -- State Variables & Data Storage
         local SelectedTarget = localPlayer
         local SelectedTargetName = localPlayer.Name
         local AutoMannequinsRunning = false
         local AutoRegistersRunning = false
+        local AutoAilmentsRunning = false
+        local ScriptEnabled = true
         local PayAmountValue = 50
-        local SelectedMode = "Mannequin" -- Can be "Mannequin", "SetOnSale", or "SetOffSale"
+        local SelectedMode = "Mannequin"
         local LastInterceptedMsg = nil
+
+        local activeAilmentUIs = {}
+        local runningTasks = {}
+        local SelectedPetUniqueId = nil
+        local CurrentTask = nil
+
+        -- Updated dirty furniture to ModernShower
+        local UserFurniture = {
+            dirty = { "ModernShower" },
+            sleepy = { "ThreeFurn2025ComfyPetBed" },
+            thirsty = { "ModernPetBowls", block = "UseBlock2" },
+            hungry = { "ModernPetBowls", block = "UseBlock" },
+            toilet = { "Toilet" },
+            bored = { "Piano" }
+        }
 
         local function ResolvePlayer(targetName)
             if not targetName or targetName == "None" or targetName == "Loading..." or targetName == "No Players Found" then 
@@ -77,7 +101,6 @@ task.spawn(function()
             return #names > 0 and names or {"No Players Found"}
         end
 
-        -- Scan outfits table to find if version is already owned, and return its slot key if found
         local function FindOwnedOutfitKey(versionToCheck)
             local foundKey = nil
             pcall(function()
@@ -105,6 +128,7 @@ task.spawn(function()
         local function returnToHouse(targetOwner)
             task.spawn(function()
                 pcall(function()
+                    local DynamicLocationDB = require(ReplicatedStorage.ClientDB.DynamicLocationDB)
                     if DynamicLocationDB and DynamicLocationDB.housing then
                         DynamicLocationDB.housing.dynamic_location({
                             house_owner = targetOwner or localPlayer,
@@ -112,7 +136,7 @@ task.spawn(function()
                         })
                     end
 
-                    local ClientStore = load("ClientStore")
+                    local ClientStore = Fsys.load("ClientStore")
                     if ClientStore and ClientStore.store then
                         ClientStore.store:dispatch({
                             ["type"] = "set_house_edit_mode",
@@ -120,7 +144,7 @@ task.spawn(function()
                         })
                     end
                     
-                    local uiManagerInstance = load("UIManager")
+                    local uiManagerInstance = Fsys.load("UIManager")
                     if uiManagerInstance and uiManagerInstance.apps and uiManagerInstance.apps.HouseEditorWrapperApp then
                         uiManagerInstance.apps.HouseEditorWrapperApp:clear_drawer()
                     end
@@ -156,6 +180,7 @@ task.spawn(function()
         local function GetOutfitVersionList()
             local versions = {"All Versions"}
             pcall(function()
+                local FurnitureMannequinsHelper = Fsys.load("FurnitureMannequinsHelper")
                 if not FurnitureMannequinsHelper or type(FurnitureMannequinsHelper.get_mannequins) ~= "function" then return end
                 local mannequins = FurnitureMannequinsHelper.get_mannequins() or {}
                 for _, m in pairs(mannequins) do
@@ -177,6 +202,275 @@ task.spawn(function()
             return #versions > 1 and versions or {"All Versions", "No Outfits Found"}
         end
 
+        local function getAilmentIdFromInstance(ailmentInstance)
+            if not ailmentInstance or type(ailmentInstance) ~= "table" then return "UNKNOWN_INSTANCE" end
+            if ailmentInstance.kind then return tostring(ailmentInstance.kind) end
+            return "UNKNOWN_AILMENT_NAME_FALLBACK"
+        end
+
+        local function getInventoryCategory(categoryName)
+            local success, result = pcall(function()
+                if ClientData and ClientData.get then
+                    local inv = ClientData.get("inventory")
+                    if inv and inv[categoryName] then return inv[categoryName] end
+                end
+            end)
+            return success and result or {}
+        end
+
+        local function createEntityReference(player, isPet, petUniqueId)
+            return { player = player, is_pet = isPet, pet_unique = petUniqueId }
+        end
+
+        local function formatTimeRemaining(seconds)
+            if not seconds or seconds < 0 then return "N/A" end
+            local minutes = math.floor(seconds / 60)
+            local remainingSeconds = math.floor(seconds % 60)
+            if minutes > 0 then
+                return string.format("%dm %02ds", minutes, remainingSeconds)
+            else
+                return string.format("%ds", remainingSeconds)
+            end
+        end
+
+        local function isPetUsingFurniture(petModel)
+            if not petModel or typeof(petModel) ~= "Instance" then return false end
+            local stateData = StateManager and StateManager.get(petModel)
+            if stateData and stateData.states then
+                for _, state in pairs(stateData.states or {}) do
+                    if type(state) == "table" and state.furniture_id then return true end
+                end
+            end
+            return false
+        end
+
+        local function getPetModel(pUid)
+            local petModel = nil
+            pcall(function()
+                local em = ClientData.get("equip_manager")
+                local petsTable = em and em.pets or {}
+                local targetUid = pUid or SelectedPetUniqueId
+
+                local isEquippedValid = false
+                if targetUid then
+                    for _, pData in pairs(petsTable) do
+                        if type(pData) == "table" and pData.unique == targetUid then
+                            isEquippedValid = true
+                            break
+                        end
+                    end
+                end
+
+                local pets = getInventoryCategory("pets")
+                local kind = nil
+                if (isEquippedValid or not targetUid) and targetUid and pets[targetUid] and pets[targetUid].kind then
+                    kind = pets[targetUid].kind
+                end
+
+                if kind then
+                    for _, m in ipairs(Workspace.Pets:GetChildren()) do
+                        if m.Name:lower() == kind:lower():gsub("_", " ") or m.Name == kind then 
+                            petModel = m 
+                            break 
+                        end
+                    end
+                end
+                
+                if not petModel then
+                    for _, m in ipairs(Workspace.Pets:GetChildren()) do
+                        if m:IsA("Model") then
+                            petModel = m
+                            break
+                        end
+                    end
+                end
+            end)
+            return petModel or Workspace.Pets:FindFirstChildOfClass("Model")
+        end
+
+        local function runFurnitureTask(hConfig, aid, entityRef, startTime)
+            local furnitureNames = hConfig
+            local specificBlock = hConfig and hConfig.block
+            local taskKey = tostring(entityRef.pet_unique) .. "_" .. aid
+
+            if not furnitureNames then return end
+
+            while ScriptEnabled and AutoAilmentsRunning do
+                if tick() - startTime > 160 then break end
+
+                local ailments = AilmentsManager.get_ailments_for_pet(entityRef)
+                local stillActive = false
+                if ailments then
+                    for _, inst in pairs(ailments) do
+                        if getAilmentIdFromInstance(inst) == aid then
+                            stillActive = true
+                            break
+                        end
+                    end
+                end
+                if not stillActive then break end
+
+                if CurrentTask ~= nil and CurrentTask ~= taskKey then
+                    task.wait(1)
+                    continue
+                end
+
+                CurrentTask = taskKey
+                SelectedPetUniqueId = entityRef.pet_unique
+                local currentPetModel = getPetModel(entityRef.pet_unique)
+
+                if currentPetModel and typeof(currentPetModel) == "Instance" and currentPetModel.PrimaryPart then
+                    if not isPetUsingFurniture(currentPetModel) then
+                        local furnitureFolder = Workspace:FindFirstChild("HouseInteriors") and Workspace.HouseInteriors:FindFirstChild("furniture")
+                        if furnitureFolder then
+                            local activated = false
+                            for _, container in ipairs(furnitureFolder:GetChildren()) do
+                                for _, fName in ipairs(furnitureNames) do
+                                    if type(fName) == "string" then
+                                        local model = container:FindFirstChild(fName)
+                                        if model then
+                                            local fId = string.match(container.Name, "f%-%w+") or container.Name
+                                            local useBlocks = model:FindFirstChild("UseBlocks")
+                                            local inter = useBlocks and (
+                                                (specificBlock and useBlocks:FindFirstChild(specificBlock))
+                                                or useBlocks:FindFirstChild("Seat1")
+                                                or useBlocks:FindFirstChildOfClass("Part")
+                                            )
+                                            
+                                            if inter and Router then
+                                                local args = { localPlayer, fId, inter.Name, {cframe = inter:GetPivot()}, currentPetModel }
+                                                Router.get("HousingAPI/ActivateFurniture"):InvokeServer(unpack(args))
+                                                activated = true
+                                                break
+                                            end
+                                        end
+                                    end
+                                end
+                                if activated then break end
+                            end
+                        end
+                    end
+                end
+                task.wait(3)
+            end
+
+            if CurrentTask == taskKey then CurrentTask = nil end
+            runningTasks[taskKey] = nil
+        end
+
+        local function addAilmentToConsole(ailmentInstance, entityUniqueKey, entityRef)
+            local ailmentId = getAilmentIdFromInstance(ailmentInstance)
+            if not activeAilmentUIs[entityUniqueKey] then activeAilmentUIs[entityUniqueKey] = {} end
+
+            if not activeAilmentUIs[entityUniqueKey][ailmentId] then
+                activeAilmentUIs[entityUniqueKey][ailmentId] = {
+                    AilmentInstance = ailmentInstance,
+                    EntityRef = entityRef,
+                    StoredAilmentId = ailmentId
+                }
+            else
+                activeAilmentUIs[entityUniqueKey][ailmentId].AilmentInstance = ailmentInstance
+            end
+
+            local hConfig = UserFurniture[ailmentId]
+            local taskKey = tostring(entityRef.pet_unique) .. "_" .. ailmentId
+            if hConfig and entityRef.is_pet and not runningTasks[taskKey] and AutoAilmentsRunning then
+                runningTasks[taskKey] = true
+                task.spawn(function()
+                    runFurnitureTask(hConfig, ailmentId, entityRef, tick())
+                end)
+            end
+        end
+
+        local function removeAilmentFromConsole(ailmentInstance, entityUniqueKey, entityRef)
+            local ailmentIdToRemove = getAilmentIdFromInstance(ailmentInstance)
+            local foundEntry = activeAilmentUIs[entityUniqueKey] and activeAilmentUIs[entityUniqueKey][ailmentIdToRemove]
+
+            if not foundEntry then
+                for currentAilmentId, entry in pairs(activeAilmentUIs[entityUniqueKey] or {}) do
+                    if entry.AilmentInstance == ailmentInstance then
+                        ailmentIdToRemove = currentAilmentId
+                        foundEntry = entry
+                        break
+                    end
+                end
+            end
+
+            if foundEntry then
+                local storedAilmentId = foundEntry.StoredAilmentId
+                activeAilmentUIs[entityUniqueKey][storedAilmentId] = nil
+                if next(activeAilmentUIs[entityUniqueKey]) == nil then activeAilmentUIs[entityUniqueKey] = nil end
+            end
+        end
+
+        local function scanActiveAilments()
+            if not AutoAilmentsRunning then return end
+            local currentPassKeys = {}
+
+            local localPlayerKey = tostring(localPlayer.UserId)
+            local localPlayerEntity = createEntityReference(localPlayer, false, nil)
+            local localPlayerAilments = AilmentsManager.get_ailments_for_pet(localPlayerEntity)
+            if localPlayerAilments then
+                currentPassKeys[localPlayerKey] = {}
+                for _, ailmentInstance in pairs(localPlayerAilments) do
+                    local aid = getAilmentIdFromInstance(ailmentInstance)
+                    currentPassKeys[localPlayerKey][aid] = true
+                    addAilmentToConsole(ailmentInstance, localPlayerKey, localPlayerEntity)
+                end
+            end
+
+            local em = ClientData.get("equip_manager")
+            local petsTable = em and em.pets or {}
+            for _, petData in pairs(petsTable) do
+                if type(petData) == "table" and petData.unique then
+                    local realUnique = petData.unique
+                    local petEntityRef = createEntityReference(localPlayer, true, realUnique)
+                    local petAilments = AilmentsManager.get_ailments_for_pet(petEntityRef)
+                    if petAilments then
+                        currentPassKeys[realUnique] = {}
+                        for _, ailmentInstance in pairs(petAilments) do
+                            local aid = getAilmentIdFromInstance(ailmentInstance)
+                            currentPassKeys[realUnique][aid] = true
+                            addAilmentToConsole(ailmentInstance, realUnique, petEntityRef)
+                        end
+                    end
+                end
+            end
+
+            for entityKey, ailmentMap in pairs(activeAilmentUIs) do
+                for aid, entry in pairs(ailmentMap) do
+                    if not (currentPassKeys[entityKey] and currentPassKeys[entityKey][aid]) then
+                        removeAilmentFromConsole(entry.AilmentInstance, entityKey, entry.EntityRef)
+                    end
+                end
+            end
+        end
+
+        -- Always watching scanning loop
+        task.spawn(function()
+            while ScriptEnabled do
+                if AutoAilmentsRunning then
+                    pcall(scanActiveAilments)
+                end
+                task.wait(1)
+            end
+        end)
+
+        pcall(function()
+            AilmentsManager.get_ailment_created_signal():Connect(function(ailmentInstance, entityUniqueKey)
+                if not AutoAilmentsRunning then return end
+                local isPet = string.len(tostring(entityUniqueKey)) > 10
+                local entityRef = createEntityReference(localPlayer, isPet, entityUniqueKey)
+                addAilmentToConsole(ailmentInstance, tostring(entityUniqueKey), entityRef)
+            end)
+
+            AilmentsManager.get_ailment_completed_signal():Connect(function(ailmentInstance, entityUniqueKey, completionReason)
+                local isPet = string.len(tostring(entityUniqueKey)) > 10
+                local entityRef = createEntityReference(localPlayer, isPet, entityUniqueKey)
+                removeAilmentFromConsole(ailmentInstance, tostring(entityUniqueKey), entityRef)
+            end)
+        end)
+
         -- Create Native Roblox UI
         local screenGui = Instance.new("ScreenGui")
         screenGui.Name = "UltimateAdoptMeHub"
@@ -184,7 +478,7 @@ task.spawn(function()
         screenGui.Parent = playerGui
 
         local mainFrame = Instance.new("Frame")
-        mainFrame.Size = UDim2.new(0, 310, 0, 420)
+        mainFrame.Size = UDim2.new(0, 310, 0, 460)
         mainFrame.Position = UDim2.new(0.05, 0, 0.1, 0)
         mainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
         mainFrame.BorderSizePixel = 0
@@ -249,7 +543,7 @@ task.spawn(function()
         modeCorner.Parent = modeButton
 
         local statusLabel = Instance.new("TextLabel")
-        statusLabel.Size = UDim2.new(0.9, 0, 0, 50)
+        statusLabel.Size = UDim2.new(0.9, 0, 0, 55)
         statusLabel.Position = UDim2.new(0.05, 0, 0, 110)
         statusLabel.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
         statusLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
@@ -265,7 +559,7 @@ task.spawn(function()
 
         local teleportButton = Instance.new("TextButton")
         teleportButton.Size = UDim2.new(0.9, 0, 0, 30)
-        teleportButton.Position = UDim2.new(0.05, 0, 0, 165)
+        teleportButton.Position = UDim2.new(0.05, 0, 0, 170)
         teleportButton.BackgroundColor3 = Color3.fromRGB(50, 120, 180)
         teleportButton.TextColor3 = Color3.fromRGB(255, 255, 255)
         teleportButton.Font = Enum.Font.SourceSansBold
@@ -279,8 +573,8 @@ task.spawn(function()
 
         -- Auto Mannequins Toggle Button
         local mannequinsToggleBtn = Instance.new("TextButton")
-        mannequinsToggleBtn.Size = UDim2.new(0.9, 0, 0, 32)
-        mannequinsToggleBtn.Position = UDim2.new(0.05, 0, 0, 200)
+        mannequinsToggleBtn.Size = UDim2.new(0.9, 0, 0, 30)
+        mannequinsToggleBtn.Position = UDim2.new(0.05, 0, 0, 205)
         mannequinsToggleBtn.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
         mannequinsToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
         mannequinsToggleBtn.Font = Enum.Font.SourceSansBold
@@ -294,8 +588,8 @@ task.spawn(function()
 
         -- Auto Registers Toggle Button
         local registersToggleBtn = Instance.new("TextButton")
-        registersToggleBtn.Size = UDim2.new(0.9, 0, 0, 32)
-        registersToggleBtn.Position = UDim2.new(0.05, 0, 0, 237)
+        registersToggleBtn.Size = UDim2.new(0.9, 0, 0, 30)
+        registersToggleBtn.Position = UDim2.new(0.05, 0, 0, 240)
         registersToggleBtn.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
         registersToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
         registersToggleBtn.Font = Enum.Font.SourceSansBold
@@ -307,9 +601,24 @@ task.spawn(function()
         regCorner.CornerRadius = UDim.new(0, 6)
         regCorner.Parent = registersToggleBtn
 
+        -- Auto Ailments Toggle Button
+        local ailmentsToggleBtn = Instance.new("TextButton")
+        ailmentsToggleBtn.Size = UDim2.new(0.9, 0, 0, 30)
+        ailmentsToggleBtn.Position = UDim2.new(0.05, 0, 0, 275)
+        ailmentsToggleBtn.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
+        ailmentsToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        ailmentsToggleBtn.Font = Enum.Font.SourceSansBold
+        ailmentsToggleBtn.TextSize = 13
+        ailmentsToggleBtn.Text = "Auto Ailments: OFF"
+        ailmentsToggleBtn.Parent = mainFrame
+
+        local ailCorner = Instance.new("UICorner")
+        ailCorner.CornerRadius = UDim.new(0, 6)
+        ailCorner.Parent = ailmentsToggleBtn
+
         local heavyButton = Instance.new("TextButton")
         heavyButton.Size = UDim2.new(0.9, 0, 0, 38)
-        heavyButton.Position = UDim2.new(0.05, 0, 0, 274)
+        heavyButton.Position = UDim2.new(0.05, 0, 0, 310)
         heavyButton.BackgroundColor3 = Color3.fromRGB(0, 170, 127)
         heavyButton.TextColor3 = Color3.fromRGB(255, 255, 255)
         heavyButton.Font = Enum.Font.SourceSansBold
@@ -363,9 +672,7 @@ task.spawn(function()
         dropdownButton.MouseButton1Click:Connect(function()
             local names = GetPlayerNames()
             currentIndex = currentIndex + 1
-            if currentIndex > #names then
-                currentIndex = 1
-            end
+            if currentIndex > #names then currentIndex = 1 end
             local chosenName = names[currentIndex]
             SelectedTargetName = chosenName
             SelectedTarget = ResolvePlayer(chosenName)
@@ -381,9 +688,7 @@ task.spawn(function()
 
         teleportButton.MouseButton1Click:Connect(function()
             SelectedTarget = ResolvePlayer(SelectedTargetName)
-            if SelectedTarget then
-                returnToHouse(SelectedTarget)
-            end
+            if SelectedTarget then returnToHouse(SelectedTarget) end
         end)
 
         modeButton.MouseButton1Click:Connect(function()
@@ -424,9 +729,22 @@ task.spawn(function()
             end
         end)
 
+        ailmentsToggleBtn.MouseButton1Click:Connect(function()
+            AutoAilmentsRunning = not AutoAilmentsRunning
+            if AutoAilmentsRunning then
+                ailmentsToggleBtn.Text = "Auto Ailments: ON"
+                ailmentsToggleBtn.BackgroundColor3 = Color3.fromRGB(50, 150, 50)
+            else
+                ailmentsToggleBtn.Text = "Auto Ailments: OFF"
+                ailmentsToggleBtn.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
+            end
+        end)
+
         closeButton.MouseButton1Click:Connect(function()
             AutoMannequinsRunning = false
             AutoRegistersRunning = false
+            AutoAilmentsRunning = false
+            ScriptEnabled = false
             if antiAfkConnection then
                 antiAfkConnection:Disconnect()
                 antiAfkConnection = nil
@@ -437,6 +755,7 @@ task.spawn(function()
             screenGui:Destroy()
         end)
 
+        -- Status & Live Countdown Timer Loop
         task.spawn(function()
             while screenGui.Parent do
                 pcall(function()
@@ -444,14 +763,35 @@ task.spawn(function()
                     local outfitList = GetOutfitVersionList()
 
                     if not LastInterceptedMsg then
-                        statusLabel.Text = string.format("Target: %s (Anti-AFK: ON)\nRegisters: %d | Outfits: %d", 
+                        local timerText = ""
+                        if AutoAilmentsRunning then
+                            for _, ailmentMap in pairs(activeAilmentUIs) do
+                                for _, entry in pairs(ailmentMap) do
+                                    local inst = entry.AilmentInstance
+                                    if inst and type(inst.get_rate_finished_timestamp) == "function" then
+                                        local ts = inst:get_rate_finished_timestamp()
+                                        if ts then
+                                            local left = ts - workspace:GetServerTimeNow()
+                                            if left > 0 then
+                                                timerText = string.format("\n[%s]: %s left", entry.StoredAilmentId, formatTimeRemaining(left))
+                                                break
+                                            end
+                                        end
+                                    end
+                                end
+                                if timerText ~= "" then break end
+                            end
+                        end
+
+                        statusLabel.Text = string.format("Target: %s (AFK: ON)\nRegisters: %d | Outfits: %d%s", 
                             tostring(SelectedTargetName or "None"), 
                             math.max(0, #regList - 1), 
-                            math.max(0, #outfitList - 1)
+                            math.max(0, #outfitList - 1),
+                            timerText
                         )
                     end
                 end)
-                task.wait(2)
+                task.wait(1)
             end
         end)
 
@@ -478,19 +818,13 @@ task.spawn(function()
                     
                     local valid = false
                     if mode == "Neon" then
-                        if (tostring(age) == "6" or age == 6) and not isNeon then 
-                            valid = true 
-                        end
+                        if (tostring(age) == "6" or age == 6) and not isNeon then valid = true end
                     elseif mode == "Mega" then
-                        if isNeon and (tostring(age) == "6" or age == 6) then 
-                            valid = true 
-                        end
+                        if isNeon and (tostring(age) == "6" or age == 6) then valid = true end
                     end
 
                     if valid then
-                        if not speciesGroups[sId] then 
-                            speciesGroups[sId] = {} 
-                        end
+                        if not speciesGroups[sId] then speciesGroups[sId] = {} end
                         table.insert(speciesGroups[sId], uId)
                     end
                 end
@@ -499,9 +833,7 @@ task.spawn(function()
                     while #ids >= 4 do
                         local set = {ids[1], ids[2], ids[3], ids[4]}
                         table.insert(fusionQueue, {name = sId, list = set})
-                        for _ = 1, 4 do 
-                            table.remove(ids, 1) 
-                        end
+                        for _ = 1, 4 do table.remove(ids, 1) end
                     end
                 end
 
@@ -511,7 +843,7 @@ task.spawn(function()
                         for i = 1, #fusionQueue do
                             local current = fusionQueue[i]
                             pcall(function()
-                                RouterClient.get("PetAPI/DoNeonFusion"):InvokeServer(current.list)
+                                Router.get("PetAPI/DoNeonFusion"):InvokeServer(current.list)
                             end)
                             task.wait(1.5)
                         end
@@ -542,6 +874,7 @@ task.spawn(function()
                         local targetPlayer = ResolvePlayer(SelectedTargetName)
                         if not targetPlayer then return end
 
+                        local FurnitureMannequinsHelper = Fsys.load("FurnitureMannequinsHelper")
                         if SelectedMode == "Mannequin" then
                             if FurnitureMannequinsHelper then
                                 local mannequins = FurnitureMannequinsHelper.get_mannequins() or {}
@@ -554,11 +887,8 @@ task.spawn(function()
                                         if furnId and version and version ~= "nil" and version ~= "" then
                                             local existingSlotKey = FindOwnedOutfitKey(version)
                                             if existingSlotKey then
-                                                print("[Notice]: Clearing Outfit...")
-                                                print("[Notice]: Removing Outfit...")
-                                                
                                                 pcall(function()
-                                                    RouterClient.get("AvatarAPI/DeleteOutfit"):FireServer("player", "Outfit")
+                                                    Router.get("AvatarAPI/DeleteOutfit"):FireServer("player", "Outfit")
                                                 end)
 
                                                 local timeout = 0
@@ -568,7 +898,7 @@ task.spawn(function()
                                                 end
                                             end
 
-                                            RouterClient.get("AvatarAPI/BuyMannequinOutfit"):InvokeServer(targetPlayer, tostring(furnId), version, 100)
+                                            Router.get("AvatarAPI/BuyMannequinOutfit"):InvokeServer(targetPlayer, tostring(furnId), version, 100)
                                         end
                                     end)
                                 end
@@ -581,14 +911,9 @@ task.spawn(function()
                                         local parentObj = m.Parent
                                         local furnId = parentObj and parentObj:GetAttribute("furniture_unique")
                                         if furnId then
-                                            RouterClient.get("HousingAPI/ActivateFurniture"):InvokeServer(
-                                                targetPlayer,
-                                                furnId,
-                                                "UseBlock",
-                                                {
-                                                    ["price"] = 100,
-                                                    ["set_price"] = true
-                                                },
+                                            Router.get("HousingAPI/ActivateFurniture"):InvokeServer(
+                                                targetPlayer, furnId, "UseBlock",
+                                                { ["price"] = 100, ["set_price"] = true },
                                                 localPlayer.Character
                                             )
                                         end
@@ -603,13 +928,9 @@ task.spawn(function()
                                         local parentObj = m.Parent
                                         local furnId = parentObj and parentObj:GetAttribute("furniture_unique")
                                         if furnId then
-                                            RouterClient.get("HousingAPI/ActivateFurniture"):InvokeServer(
-                                                targetPlayer,
-                                                furnId,
-                                                "UseBlock",
-                                                {
-                                                    ["set_off_sale"] = true
-                                                },
+                                            Router.get("HousingAPI/ActivateFurniture"):InvokeServer(
+                                                targetPlayer, furnId, "UseBlock",
+                                                { ["set_off_sale"] = true },
                                                 localPlayer.Character
                                             )
                                         end
@@ -622,7 +943,7 @@ task.spawn(function()
             end
         end)
 
-        -- Background Worker Loop: Auto Registers (Independent Toggle)
+        -- Background Worker Loop: Auto Registers
         task.spawn(function()
             while screenGui.Parent do
                 task.wait(2.5)
@@ -637,7 +958,7 @@ task.spawn(function()
                             local regId = parts[1]
                             local char = localPlayer.Character
                             if regId and char then
-                                RouterClient.get("HousingAPI/ActivateFurniture"):InvokeServer(targetPlayer, regId, "UseBlock", PayAmountValue, char)
+                                Router.get("HousingAPI/ActivateFurniture"):InvokeServer(targetPlayer, regId, "UseBlock", PayAmountValue, char)
                             end
                         end
                     end)
