@@ -1,5 +1,3 @@
-print("Test")
-
 if not game:IsLoaded() then
     game.Loaded:Wait()
 end
@@ -34,7 +32,7 @@ while not (ClientData and Router) do
             ClientData = ClientData or Fsys.load("ClientData")
             Router = Router or Fsys.load("RouterClient")
             StateManager = Fsys.load("StateManagerClient")
-            AilmentsManager = AilmentsManager or Fsys.load("new:AilmentsClient")
+            AilmentsManager = Fsys.load("new:AilmentsClient")
             UIManager = Fsys.load("UIManager")
             
             local successPetEnt, petEntMod = pcall(function() return Fsys.load("PetEntityManager") end)
@@ -168,6 +166,45 @@ local function getInventoryCategory(categoryName)
     return success and result or {}
 end
 
+local function findHealingAppleId()
+    local foodTable = getInventoryCategory("food")
+    for uId, item in pairs(foodTable) do
+        if type(item) == "table" and (item.id == "healing_apple" or item.kind == "healing_apple") then
+            return uId
+        end
+    end
+    return nil
+end
+
+local function goToMainMapDirectly(destination)
+    pcall(function()
+        local DynamicLocationDB = require(ReplicatedStorage.ClientDB.DynamicLocationDB)
+        if DynamicLocationDB and DynamicLocationDB.main_map then
+            DynamicLocationDB.main_map.dynamic_location({ destination = destination })
+        end
+    end)
+end
+
+local function spawnPlatformUnderPlayer(aid, pUid)
+    pcall(function()
+        local char = LocalPlayer.Character
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        if root then
+            local existing = Workspace:FindFirstChild("AilmentPlatform_" .. tostring(aid))
+            if existing then existing:Destroy() end
+
+            local part = Instance.new("Part")
+            part.Name = "AilmentPlatform_" .. tostring(aid)
+            part.Size = Vector3.new(10, 1, 10)
+            part.Anchored = true
+            part.CFrame = root.CFrame - Vector3.new(0, 4, 0)
+            part.Transparency = 0.5
+            part.BrickColor = BrickColor.new("Bright blue")
+            part.Parent = Workspace
+        end
+    end)
+end
+
 local function getEntityDisplayInfo(entityRef)
     if not entityRef then return "Unknown Entity", "N/A" end
 
@@ -292,7 +329,7 @@ local title = Instance.new("TextLabel")
 title.Size = UDim2.new(0.8, 0, 0, 35)
 title.Position = UDim2.new(0.05, 0, 0, 0)
 title.BackgroundTransparency = 1
-title.Text = "Ultimate Hub (v6.8)"
+title.Text = "Ultimate Hub (v6.9 Play & Sick Added)"
 title.TextColor3 = Color3.fromRGB(255, 255, 255)
 title.Font = Enum.Font.SourceSansBold
 title.TextSize = 14
@@ -610,20 +647,25 @@ local function getPetModelForUnique(targetUid)
 end
 
 local function runFurnitureTask(hConfig, aid, entityRef, startTime)
-    local furnitureNames = hConfig
-    local specificBlock = hConfig and hConfig.block
-    local targetUnique = tostring(entityRef.pet_unique)
+    local pUid = tostring(entityRef.pet_unique)
+    local targetUnique = pUid
     local taskKey = targetUnique .. "_" .. aid
     local petDisplayName = select(1, getEntityDisplayInfo(entityRef))
+
+    local function scriptRunning()
+        return ScriptEnabled and AutoAilmentsRunning
+    end
+
+    local function isStillActive()
+        return activeAilmentUIs[targetUnique] and activeAilmentUIs[targetUnique][aid]
+    end
 
     -- HANDLE "PET_ME" AILMENT SPECIFICALLY
     if aid == "pet_me" then
         task.spawn(function()
-            while ScriptEnabled and AutoAilmentsRunning do
+            while scriptRunning() do
                 if tick() - startTime > 160 then break end
-                if not (activeAilmentUIs[targetUnique] and activeAilmentUIs[targetUnique]["pet_me"]) then
-                    break
-                end
+                if not isStillActive() then break end
 
                 local targetModel = getPetModelForUnique(targetUnique)
                 local targetEntity = nil
@@ -659,15 +701,98 @@ local function runFurnitureTask(hConfig, aid, entityRef, startTime)
         return
     end
 
+    -- HANDLE "PLAY" AILMENT
+    if aid == "play" then
+        task.spawn(function()
+            goToMainMapDirectly("Default")
+            spawnPlatformUnderPlayer(aid, entityRef.is_pet and pUid or nil)
+            task.wait(0.3)
+
+            local toyTable = getInventoryCategory("toys")
+            for uId, item in pairs(toyTable) do 
+                if type(item) == "table" and item.id == "squeaky_bone_default" then 
+                    if Router then 
+                        pcall(function() Router.get("ToolAPI/Equip"):InvokeServer(unpack({uId}, 1, 1)) end)
+                    end
+                    task.wait(1.2)
+                    while scriptRunning() and isStillActive() and (tick() - startTime < 60) do
+                        if Router then
+                            pcall(function()
+                                Router.get("ToolAPI/ServerUseTool"):InvokeServer(unpack({uId, "START"}, 1, 2))
+                                Router.get("PetObjectAPI/CreatePetObject"):InvokeServer(unpack({"__Enum_PetObjectCreatorType_1", {reaction_name = "ThrowToyReaction", unique_id = uId}}, 1, 2))
+                                Router.get("PetObjectAPI/CreatePetObject"):InvokeServer(unpack({"__Enum_PetObjectCreatorType_2", {additional_consume_uniques = {uId}, pet_unique = pUid, unique_id = uId}}, 1, 2))
+                            end)
+                        end
+                        task.wait(12)
+                    end
+                    if Router then
+                        pcall(function()
+                            Router.get("ToolAPI/ServerUseTool"):InvokeServer(unpack({uId, "END"}, 1, 2))
+                            task.wait(0.5)
+                            Router.get("ToolAPI/Unequip"):InvokeServer(unpack({uId}, 1, 1))
+                        end)
+                    end
+                    break 
+                end 
+            end
+            runningTasks[taskKey] = nil
+        end)
+        return
+    end
+
+    -- HANDLE "SICK" AILMENT
+    if aid == "sick" then
+        task.spawn(function()
+            spawnPlatformUnderPlayer(aid, entityRef.is_pet and pUid or nil)
+            task.wait(0.3)
+
+            local targetUid = findHealingAppleId()
+            if not targetUid and Router then
+                pcall(function() Router.get("ShopAPI/BuyItem"):InvokeServer(unpack({"food", "healing_apple", {buy_count = 1}}, 1, 3)) end)
+                task.wait(1.5)
+                targetUid = findHealingAppleId()
+            end
+            if targetUid and Router then
+                pcall(function() Router.get("ToolAPI/Equip"):InvokeServer(unpack({targetUid}, 1, 1)) end)
+                task.wait(1.2)
+                while scriptRunning() and isStillActive() and (tick() - startTime < 60) do
+                    if entityRef.is_pet then
+                        pcall(function()
+                            Router.get("PetObjectAPI/CreatePetObject"):InvokeServer(unpack({"__Enum_PetObjectCreatorType_2", {
+                                additional_consume_uniques = {},
+                                pet_unique = pUid,
+                                unique_id = targetUid
+                            }}, 1, 2))
+                        end)
+                        task.wait(12)
+                    else
+                        pcall(function()
+                            Router.get("ToolAPI/ServerUseTool"):InvokeServer(unpack({targetUid, "START"}, 1, 2))
+                            task.wait(0.1)
+                            Router.get("ToolAPI/ServerUseTool"):InvokeServer(unpack({targetUid, "END"}, 1, 2))
+                        end)
+                    end
+                    task.wait(4)
+                end
+                pcall(function() Router.get("ToolAPI/Unequip"):InvokeServer(unpack({targetUid}, 1, 1)) end)
+            end
+            runningTasks[taskKey] = nil
+        end)
+        return
+    end
+
+    local furnitureNames = hConfig
+    local specificBlock = hConfig and hConfig.block
+
     if not furnitureNames then
         runningTasks[taskKey] = nil
         return
     end
 
-    while ScriptEnabled and AutoAilmentsRunning do
+    while scriptRunning() do
         if tick() - startTime > 160 then break end
 
-        if not (activeAilmentUIs[targetUnique] and activeAilmentUIs[targetUnique][aid]) then
+        if not isStillActive() then
             break
         end
 
@@ -778,9 +903,9 @@ local function addAilmentToConsole(ailmentInstance, entityUniqueKey, entityRef)
         activeAilmentUIs[entityUniqueKey][ailmentId].AilmentInstance = ailmentInstance
     end
 
-    local hConfig = UserFurniture[ailmentId] or (ailmentId == "pet_me" and true or nil)
+    local hConfig = UserFurniture[ailmentId] or (ailmentId == "pet_me" or ailmentId == "play" or ailmentId == "sick" and true or nil)
     local taskKey = tostring(entityRef.pet_unique) .. "_" .. ailmentId
-    if hConfig and entityRef.is_pet and not runningTasks[taskKey] and AutoAilmentsRunning then
+    if (UserFurniture[ailmentId] or ailmentId == "pet_me" or ailmentId == "play" or ailmentId == "sick") and entityRef.is_pet and not runningTasks[taskKey] and AutoAilmentsRunning then
         runningTasks[taskKey] = true
         task.spawn(function()
             print(string.format("[Ailment Trigger] Spawning task loop for %s on pet [%s : %s]", ailmentId, entityDisplayName, entityUniqueIdForDisplay))
